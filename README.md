@@ -30,6 +30,7 @@ Choose the extension you want to install. If not, press 0
    xxx는 cse-students 내부 네트워크에서 본인 IP 주소 끝자리. 10.0.0.xxx)
 
 5. 성공한 경우 출력 예
+
 ```
 Ubuntu 20.04.2 LTS
 Installing v3.11.0 of the amd64 deb package from GitHub.
