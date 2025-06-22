@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+kubernetes
+PyJWT
+python-dotenv
+prometheus_client
+prometheus_fastapi_instrumentator

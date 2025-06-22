@@ -1,0 +1,25 @@
+### generator ###
+generator/.env
+generator/docker-compose.yaml
+generator/*.tar
+
+### router ###
+router/dev/
+router/.env
+router/.env.*
+!router/.env.example
+router/squid/squid.conf
+router/supervisor/supervisord.conf
+router/supervisord/
+router/*.tar
+
+### k8s manifest ###
+k8s/
+
+### image ###
+image/code-server/*.tar
+image/code-server-vnc/*.tar
+image/code-server-vnc/supervisor/supervisord.conf
+
+### etc ###
+.gitmessage.txt
