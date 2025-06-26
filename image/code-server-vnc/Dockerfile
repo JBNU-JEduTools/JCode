@@ -51,6 +51,12 @@ RUN mkdir -p /runtime && \
 # === Final Stage ===
 FROM codercom/code-server:4.98.0
 
+LABEL org.opencontainers.image.title="code-server-vnc"
+LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc 환경 이미지"
+LABEL org.opencontainers.image.authors="OSLAB"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
+
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
