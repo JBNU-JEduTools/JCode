@@ -1,3 +1,6 @@
 [submodule "Backend"]
 	path = Backend
 	url = https://github.com/JBNU-JEduTools/JCode-Backend.git
+[submodule "Watcher"]
+	path = Watcher
+	url = https://github.com/JBNU-JEduTools/JCode-Watcher.git
