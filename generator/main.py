@@ -177,9 +177,9 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
-        init_command=["sh", "-c", "\
+        base_cmd = "\
             chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/.local"]
+            chown -R 1000:1000 /home/coder/.local"
         init_volume_mounts.append(
             client.V1VolumeMount(
                 name="snapshot-volume",
@@ -203,16 +203,32 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             )
         )
     else:
-        init_command=["sh", "-c", "\
+        base_cmd="\
             chown -R 1000:1000 /home/coder/project && \
             for i in $(seq 1 10); do mkdir -p /home/coder/project/hw$i && chown -R 1000:1000 /home/coder/project/hw$i; done && \
-            chown -R 1000:1000 /home/coder/.local"]
+            chown -R 1000:1000 /home/coder/.local"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
             mount_path="/home/coder/project",
             sub_path=file_path
         )
         init_volume_mounts.append(volume_mount)
+
+        if use_vnc:
+            hook_volume_mount=client.V1VolumeMount(
+                name="hook-vol",
+                mount_path="/home/coder/.ipython/profile_default/startup/99-hook.py",
+                sub_path="99-watcher-hook.py"
+            )
+            hook_volume=client.V1Volume(
+                name="hook-vol",
+                config_map=client.V1ConfigMapVolumeSource(name="watcher-hook-config")
+            )
+
+            volume_mounts.append(hook_volume_mount)
+            volumes.append(hook_volume)
+
+    init_command = ["sh", "-c", base_cmd]
     volume_mounts.append(volume_mount)
 
     # VNC를 사용할 경우 추가 설정

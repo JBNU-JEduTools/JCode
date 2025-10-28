@@ -85,6 +85,23 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     netcat-openbsd && \
     rm -rf /var/lib/apt/lists/*
 
+# coder 유저의 pip 설정 추가 (break-system-packages)
+RUN mkdir -p /home/coder/.config/pip && \
+    echo "[global]\n \
+        break-system-packages = true\n \
+        trusted-host = pypi.org\n \
+        index-url = https://pypi.org/simple\n\n \
+        [install]\n \
+        user = true" > /home/coder/.config/pip/pip.conf
+
+ENV PATH="${PATH}:/home/coder/.local/bin"
+
+# Jupyter 기본 패키지 설치 (가상환경 없이)
+RUN mkdir -p /home/coder/.ipython/profile_default/startup
+RUN pip3 install --upgrade pip --break-system-packages && \
+    pip3 install ipykernel --break-system-packages && \
+    python3 -m ipykernel install --user --name=python3 --display-name "Python 3 (System)"
+
 # 설정 파일들을 제 위치로 복사
 RUN cp -r /runtime/.vnc /home/coder/ && \
     cp -r /runtime/.xsession /home/coder/ && \
@@ -94,7 +111,8 @@ RUN cp -r /runtime/.vnc /home/coder/ && \
     mkdir -p /home/coder/.local/share/code-server && \
     mkdir -p /logs && \
     chown -R 1000:1000 /logs && \
-    chown -R 1000:1000 /home/coder
+    chown -R 1000:1000 /home/coder && \
+    chown -R 1000:1000 /home/coder/.ipython/profile_default/startup
 
 # supervisord.conf 복사 (Docker build 컨텍스트 내 supervisor 디렉토리에 위치)
 COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
