@@ -6,3 +6,7 @@
 	path = Watcher
 	url = https://github.com/JBNU-JEduTools/JCode-Watcher.git
 	branch = main
+[submodule "Frontend"]
+	path = Frontend
+	url = https://github.com/JBNU-JEduTools/JCode-Frontend.git
+	branch = master
