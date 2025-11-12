@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jcode-router
+  namespace: watcher
+  labels:
+    app: jcode-router
+spec:
+  selector:
+    matchLabels:
+      app: jcode-router
+  template:
+    metadata:
+      labels:
+        app: jcode-router
+    spec:
+      containers:
+        - name: jcode-router
+          image: jcode-router:test
+          ports:
+            - containerPort: 3001  # Node.js 프록시 포트
+            - containerPort: 3000  # Squid 프록시 포트 추가
+          envFrom:
+            - configMapRef:
+                name: jcode-router-config
+            - secretRef:
+                name: jcode-router-secret
+          resources:
+            requests:
+              cpu: 1
+              memory: 1.5Gi
+            limits:
+              memory: 7Gi
+          volumeMounts:
+            - name: squid-config
+              mountPath: /etc/squid/squid.conf
+              subPath: squid.conf
+      volumes:
+        - name: squid-config
+          configMap:
+            name: squid-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jcode-router-svc
+  namespace: watcher
+  labels:
+    app: jcode-router
+spec:
+  selector:
+    app: jcode-router
+  ports:
+    - name: node-proxy
+      protocol: TCP
+      port: 3001  # 외부에서 접근하는 Node.js 포트
+      targetPort: 3001  # 컨테이너 내부의 Node.js 포트
+    - name: squid-proxy
+      protocol: TCP
+      port: 3000  # Squid 프록시 포트 추가
+      targetPort: 3000  # 컨테이너 내부의 Squid 포트
+  type: ClusterIP  # 내부 통신을 위해 사용 (Ingress와 연결 가능)
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jcode-router-metrics
+  namespace: watcher
+  labels:
+    app: jcode-router
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: jcode-router
+  namespaceSelector:
+    matchNames:
+      - watcher
+  endpoints:
+    - port: node-proxy
+      path: /metrics
+      interval: 30s

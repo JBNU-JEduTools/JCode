@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jcode-generator-configmap
+  namespace: watcher
+data:
+  ALGORITHM: "HS256"
+  NFS_SERVER: "your.nfs.server.address"
+  NFS_PATH: "/yourPath"
+  SNAPSHOT_NFS_SERVER: "your.nfs.snapshot.server.address"
+  SNAPSHOT_NFS_PATH: "/yourSnapshotPath"
+  SERVICE_ACCOUNT: "deployment-controller"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jcode-generator-secret
+  namespace: watcher
+type: Opaque
+data:
+  SECRET_KEY: "WU9VUl9TRUNSRVRfS0VZX0JBU0U2NA==" # ("YOUR_SECRET_KEY_BASE64")
