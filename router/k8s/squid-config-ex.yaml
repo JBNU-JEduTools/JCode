@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: squid-config
+  namespace: watcher
+data:
+  squid.conf: |
+    # HTTP 포트 설정
+    http_port {{HTTP_PORT}}
+
+    # 10.x.x.x 대역에서 오는 모든 트래픽 허용
+    acl localnet src {{ALLOWED_NETWORK_CIDR}}
+    http_access allow localnet
+
+    # 기본적으로 모든 외부 접근 차단
+    http_access deny all
+
+    # 디스크 캐시 비활성화
+    cache deny all
+    cache_dir null /dev/null
+
+    # 메모리 캐시 비활성화 (필요 시 주석 해제)
+    ; cache_mem 0 MB

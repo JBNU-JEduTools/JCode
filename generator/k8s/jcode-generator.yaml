@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jcode-generator
+  namespace: watcher
+  labels:
+    app: jcode-generator
+spec:
+  selector:
+    matchLabels:
+      app: jcode-generator
+  template:
+    metadata:
+      labels:
+        app: jcode-generator
+    spec:
+      serviceAccountName: jcode-generator  # 설정된 네임스페이스에 배포 권한을 가지는 서비스어카운트 (jcode-init)
+      containers:
+      - name: jcode-generator
+        image: jcode-generator:test
+        ports:
+        - containerPort: 5000
+        envFrom:
+        - configMapRef:
+            name: jcode-generator-configmap
+        - secretRef:
+            name: jcode-generator-secret
+        resources:
+          requests:
+            cpu: 200m
+            memory: 1.5Gi
+          limits:
+            memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jcode-generator-svc
+  namespace: watcher
+  labels:
+    app: jcode-generator
+spec:
+  type: ClusterIP
+  selector:
+    app: jcode-generator
+  ports:
+  - name: generator
+    port: 5000
+    targetPort: 5000
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jcode-generator-monitor
+  namespace: watcher
+  labels:
+    app: jcode-generator
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: jcode-generator
+  namespaceSelector:
+    matchNames:
+      - watcher
+  endpoints:
+    - port: generator
+      path: /metrics
+      interval: 30s

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jcode-router-config
+  namespace: watcher
+data:
+  NODE_ENV: "production"
+  PORT: "3001"
+  SPRING_REFRESH_URL: "https://your.domain/refresh"
+  REDIS_HOST: "localhost"
+  REDIS_PORT: "6379"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jcode-router-secret
+  namespace: watcher
+type: Opaque
+data:
+  JWT_SECRET: "WU9VUl9KV1RfU0VDUkVUX0JBU0U2NA=="   # Base64 인코딩된 값 ("YOUR_JWT_SECRET_BASE64" → `echo -n "YOUR_JWT_SECRET_BASE64" | base64`)
+  JWT_REFRESH_SECRET: "WU9VUl9KV1RfUkVGUkVTSF9TRUNSRVRfQkFTRTY0"   # Base64 인코딩된 값 ("YOUR_JWT_REFRESH_SECRET_BASE64")
