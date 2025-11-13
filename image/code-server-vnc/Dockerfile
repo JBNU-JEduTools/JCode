@@ -117,7 +117,7 @@ RUN cp -r /runtime/.vnc /home/coder/ && \
 # supervisord.conf 복사 (Docker build 컨텍스트 내 supervisor 디렉토리에 위치)
 COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
 
-# 포트 개방 (code-server:8080, VNC:5900~5910, noVNC:6080~6100)
+# 포트 개방 (code-server:8080, VNC:5900~5910, websockify(noVNC):6080~6100)
 EXPOSE 8080 5900-5910 6080-6100
 
 # supervisord를 통해 모든 서비스 실행 (nodaemon 옵션이 supervisord.conf에 설정되어 있음)

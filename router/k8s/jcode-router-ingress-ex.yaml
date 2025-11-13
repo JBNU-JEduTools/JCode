@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jcode-router-ingress
+  namespace: watcher
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/enable-websockets: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - {{ host }}
+      secretName: {{ tls-seret }}
+  rules:
+    - host: {{ host }}
+      http:
+        paths:
+          - path: /jcode
+            pathType: Prefix
+            backend:
+              service:
+                name: jcode-router-svc
+                port:
+                  number: 3001
+    - host: {{ host }}
+      http:
+        paths:
+          - path: /jcode-logout
+            pathType: Prefix
+            backend:
+              service:
+                name: jcode-router-svc
+                port:
+                  number: 3001
+    - host: {{ host }}
+      http:
+        paths:
+          - path: /websockify
+            pathType: Prefix
+            backend:
+              service:
+                name: jcode-router-svc
+                port:
+                  number: 3001
