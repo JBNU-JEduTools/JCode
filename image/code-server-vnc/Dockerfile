@@ -80,6 +80,8 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     python3-pip \
     python3-tk \
     gcc \
+    gdb \
+    build-essential \
     libc6-dev \
     supervisor \
     netcat-openbsd && \

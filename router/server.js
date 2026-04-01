@@ -240,19 +240,11 @@ app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, n
     const { sub, role } = req.user;
     console.log(`course: ${courseCode}:${clss}, studentEmail: ${studentEmail}, email: ${sub}, role: ${role}`);
     
-    // 권한 체크
-    if (role && !role.includes("ADMIN")) {
-      if (role.includes("PROFESSOR") || role.includes("ASSISTANT")) {
-        const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
-        // 교수/조교인데 매니저 할당이 안 되어 있다면, 자신의 이메일인지 추가 체크합니다.
-        if (!isManager && sub !== studentEmail) {
-          return closeWindowWithMessage(res, 403,"이 강의에 접근 권한이 없습니다 (교수/조교 미할당 및 이메일 불일치).");
-        }
-      } else {
-        // 교수/조교가 아닌 경우, 자신의 이메일 여부만 확인합니다.
-        if (sub !== studentEmail) {
-          return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다 (이메일 불일치).");
-        }
+    // 권한 체크: ADMIN이 아닌 모든 유저는 Redis courseManagerList 또는 본인 이메일로 확인
+    if (!role || !role.includes("ADMIN")) {
+      const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+      if (!isManager && sub !== studentEmail) {
+        return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
       }
     }
     

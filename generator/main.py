@@ -5,7 +5,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -60,11 +60,16 @@ class DeployRequest(BaseModel):
     student_num: str
     use_vnc: bool
     use_snapshot: bool
+    hw_count: int = Field(default=10, ge=10, le=15)
+    prac_count: int = Field(default=0, ge=0, le=10)
 
 class DeleteRequest(BaseModel):
     namespace: str
     deployment_name: str
     service_name: str
+
+class NamespaceRequest(BaseModel):
+    namespace: str
 
 # HTTP Bearer 인증 사용
 security = HTTPBearer()
@@ -131,7 +136,7 @@ def load_incluster_config_or_fail():
 
 # # ---------------------------------
 
-def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool) -> str:
+def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0) -> str:
     init_volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
@@ -173,7 +178,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
     ]
 
     # 기본 code-server 이미지
-    image_name = "code-server:test"
+    image_name = os.getenv("CODE_SERVER_IMAGE", "code-server:test")
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
@@ -203,9 +208,12 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             )
         )
     else:
-        base_cmd="\
+        hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
+        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 else ""
+        base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
-            for i in $(seq 1 10); do mkdir -p /home/coder/project/hw$i && chown -R 1000:1000 /home/coder/project/hw$i; done && \
+            {hw_cmd}{prac_cmd} && \
+            chown -R 1000:1000 /home/coder/project && \
             chown -R 1000:1000 /home/coder/.local"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
@@ -233,7 +241,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
 
     # VNC를 사용할 경우 추가 설정
     if use_vnc:
-        image_name = "code-server-vnc:test"
+        image_name = os.getenv("CODE_SERVER_VNC_IMAGE", "code-server-vnc:test")
 
         container_ports.append(client.V1ContainerPort(container_port=5901))  # VNC 포트 추가
         container_ports.append(client.V1ContainerPort(container_port=6080))  # noVNC 포트 추가
@@ -261,7 +269,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                         client.V1Container(
                             name="code-server",
                             image=image_name,
-                            image_pull_policy="IfNotPresent",
+                            image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
                             env=[
                                 client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
@@ -354,6 +362,226 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
         logger.exception("Service 삭제 중 오류:")
         raise Exception(f"Service 삭제 중 오류: {str(e)}")
     
+################ Namespace 관리 함수 ##################
+
+GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
+GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
+NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
+WATCHER_NAMESPACE = os.getenv("WATCHER_NAMESPACE", "watcher")
+
+def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str):
+    """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
+
+    # 1. Namespace
+    ns_body = client.V1Namespace(
+        metadata=client.V1ObjectMeta(
+            name=namespace,
+            labels={"role": NS_ROLE_LABEL}
+        )
+    )
+    try:
+        core_v1_api.create_namespace(body=ns_body)
+        logger.info(f"Namespace '{namespace}' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"Namespace '{namespace}'가 이미 존재합니다.")
+        else:
+            raise
+
+    # 2. ServiceAccount
+    sa_body = client.V1ServiceAccount(
+        metadata=client.V1ObjectMeta(
+            name="deployment-controller",
+            namespace=namespace
+        )
+    )
+    try:
+        core_v1_api.create_namespaced_service_account(namespace=namespace, body=sa_body)
+        logger.info(f"ServiceAccount 'deployment-controller' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"ServiceAccount 'deployment-controller'가 이미 존재합니다.")
+        else:
+            raise
+
+    # 3. Role
+    role_body = client.V1Role(
+        metadata=client.V1ObjectMeta(
+            name="deployment-manager",
+            namespace=namespace
+        ),
+        rules=[
+            client.V1PolicyRule(
+                api_groups=["apps"],
+                resources=["deployments"],
+                verbs=["create", "get", "list", "watch", "update", "patch", "delete"]
+            ),
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["services"],
+                verbs=["create", "get", "list", "watch", "update", "patch", "delete"]
+            ),
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["configmaps"],
+                verbs=["get", "list", "watch"]
+            ),
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["secrets"],
+                verbs=["get", "list", "watch"]
+            ),
+        ]
+    )
+    try:
+        rbac_v1_api.create_namespaced_role(namespace=namespace, body=role_body)
+        logger.info(f"Role 'deployment-manager' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"Role 'deployment-manager'가 이미 존재합니다.")
+        else:
+            raise
+
+    # 4. RoleBinding
+    rb_body = client.V1RoleBinding(
+        metadata=client.V1ObjectMeta(
+            name="deployment-manager-binding",
+            namespace=namespace
+        ),
+        subjects=[
+            client.RbacV1Subject(
+                kind="ServiceAccount",
+                name=GENERATOR_SA_NAME,
+                namespace=GENERATOR_SA_NAMESPACE
+            )
+        ],
+        role_ref=client.V1RoleRef(
+            kind="Role",
+            name="deployment-manager",
+            api_group="rbac.authorization.k8s.io"
+        )
+    )
+    try:
+        rbac_v1_api.create_namespaced_role_binding(namespace=namespace, body=rb_body)
+        logger.info(f"RoleBinding 'deployment-manager-binding' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"RoleBinding 'deployment-manager-binding'가 이미 존재합니다.")
+        else:
+            raise
+
+    # 5. ConfigMap (code-server-config)
+    cm_body = client.V1ConfigMap(
+        metadata=client.V1ObjectMeta(
+            name="code-server-config",
+            namespace=namespace
+        ),
+        data={
+            "config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"
+        }
+    )
+    try:
+        core_v1_api.create_namespaced_config_map(namespace=namespace, body=cm_body)
+        logger.info(f"ConfigMap 'code-server-config' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"ConfigMap 'code-server-config'가 이미 존재합니다.")
+        else:
+            raise
+
+    # 6. LimitRange
+    lr_body = client.V1LimitRange(
+        metadata=client.V1ObjectMeta(
+            name="pod-resource-limits",
+            namespace=namespace
+        ),
+        spec=client.V1LimitRangeSpec(
+            limits=[
+                client.V1LimitRangeItem(
+                    type="Container",
+                    default_request={"cpu": "200m", "memory": "256Mi"},
+                    default={"cpu": "4", "memory": "2Gi"}
+                )
+            ]
+        )
+    )
+    try:
+        core_v1_api.create_namespaced_limit_range(namespace=namespace, body=lr_body)
+        logger.info(f"LimitRange 'pod-resource-limits' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"LimitRange 'pod-resource-limits'가 이미 존재합니다.")
+        else:
+            raise
+
+    # 7. NetworkPolicy
+    np_body = client.V1NetworkPolicy(
+        metadata=client.V1ObjectMeta(
+            name="watcher-networkpolicy",
+            namespace=namespace
+        ),
+        spec=client.V1NetworkPolicySpec(
+            pod_selector=client.V1LabelSelector(),
+            ingress=[
+                client.V1NetworkPolicyIngressRule(
+                    _from=[
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"role": NS_ROLE_LABEL}
+                            )
+                        ),
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
+                            )
+                        ),
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": "monitoring"}
+                            )
+                        ),
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": "ingress-nginx"}
+                            )
+                        ),
+                    ]
+                )
+            ],
+            policy_types=["Ingress"]
+        )
+    )
+    try:
+        networking_v1_api.create_namespaced_network_policy(namespace=namespace, body=np_body)
+        logger.info(f"NetworkPolicy 'watcher-networkpolicy' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            logger.info(f"NetworkPolicy 'watcher-networkpolicy'가 이미 존재합니다.")
+        else:
+            raise
+
+
+def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
+    """NS 내 모든 Deployment, Service, Pod를 삭제합니다 (NS 자체는 유지)."""
+    # Deployment 전체 삭제
+    deployments = apps_v1_api.list_namespaced_deployment(namespace=namespace)
+    for dep in deployments.items:
+        apps_v1_api.delete_namespaced_deployment(name=dep.metadata.name, namespace=namespace)
+        logger.info(f"Deployment '{dep.metadata.name}' 삭제 완료")
+
+    # Service 전체 삭제 (kubernetes default service 제외)
+    services = core_v1_api.list_namespaced_service(namespace=namespace)
+    for svc in services.items:
+        if svc.metadata.name == "kubernetes":
+            continue
+        core_v1_api.delete_namespaced_service(name=svc.metadata.name, namespace=namespace)
+        logger.info(f"Service '{svc.metadata.name}' 삭제 완료")
+
+    # Pod 전체 삭제
+    core_v1_api.delete_collection_namespaced_pod(namespace=namespace)
+    logger.info(f"Namespace '{namespace}'의 모든 Pod 삭제 완료")
+
+
 ################ API ##################
     
 # # prometheus-client 설정
@@ -367,6 +595,78 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
 #         logger.exception("메트릭 생성 중 오류:")
 #         raise HTTPException(status_code=500, detail="메트릭 생성 중 오류가 발생했습니다.")
 
+@app.post("/api/namespace")
+async def create_namespace_api(request: NamespaceRequest, token_payload: dict = Depends(verify_token)):
+    """NS 초기화: Namespace + SA + Role + RoleBinding + ConfigMap + LimitRange + NetworkPolicy"""
+    try:
+        load_incluster_config_or_fail()
+    except Exception as e:
+        logger.exception("인클러스터 구성 로딩 실패:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    core_v1_api = client.CoreV1Api()
+    apps_v1_api = client.AppsV1Api()
+    rbac_v1_api = client.RbacAuthorizationV1Api()
+    networking_v1_api = client.NetworkingV1Api()
+
+    try:
+        init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, request.namespace)
+        return {"msg": f"Namespace '{request.namespace}' 초기화 완료"}
+    except Exception as e:
+        logger.exception("네임스페이스 초기화 중 오류:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/namespace/{ns}")
+async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_token)):
+    """NS 삭제: 네임스페이스와 내부 모든 리소스를 삭제합니다."""
+    try:
+        load_incluster_config_or_fail()
+    except Exception as e:
+        logger.exception("인클러스터 구성 로딩 실패:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    core_v1_api = client.CoreV1Api()
+
+    try:
+        core_v1_api.read_namespace(name=ns)
+    except ApiException:
+        raise HTTPException(status_code=404, detail=f"Namespace '{ns}'가 존재하지 않습니다.")
+
+    try:
+        core_v1_api.delete_namespace(name=ns)
+        logger.info(f"Namespace '{ns}' 삭제 완료")
+        return {"msg": f"Namespace '{ns}' 삭제 완료"}
+    except Exception as e:
+        logger.exception("네임스페이스 삭제 중 오류:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/namespace/{ns}/resources")
+async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(verify_token)):
+    """NS 내 전체 Deployment/Service/Pod 삭제 (NS 자체는 유지)."""
+    try:
+        load_incluster_config_or_fail()
+    except Exception as e:
+        logger.exception("인클러스터 구성 로딩 실패:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    core_v1_api = client.CoreV1Api()
+    apps_v1_api = client.AppsV1Api()
+
+    try:
+        core_v1_api.read_namespace(name=ns)
+    except ApiException:
+        raise HTTPException(status_code=404, detail=f"Namespace '{ns}'가 존재하지 않습니다.")
+
+    try:
+        delete_all_resources_in_namespace(core_v1_api, apps_v1_api, ns)
+        return {"msg": f"Namespace '{ns}'의 모든 리소스 삭제 완료"}
+    except Exception as e:
+        logger.exception("리소스 삭제 중 오류:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/jcode")
 async def deploy_resources(request: DeployRequest, token_payload: dict = Depends(verify_token)):
     try:
@@ -378,15 +678,18 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
-    # 네임스페이스 존재 여부 확인
+    # 네임스페이스 존재 여부 확인 — 없으면 자동 생성
     try:
         core_v1_api.read_namespace(name=request.namespace)
-    except ApiException as e:
-        logger.exception("네임스페이스 조회 오류:")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Namespace '{request.namespace}'가 존재하지 않습니다. 관리자에게 문의하세요."
-        )
+    except ApiException:
+        logger.info(f"Namespace '{request.namespace}'가 없습니다. 자동 생성합니다.")
+        try:
+            rbac_v1_api = client.RbacAuthorizationV1Api()
+            networking_v1_api = client.NetworkingV1Api()
+            init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, request.namespace)
+        except Exception as e:
+            logger.exception("네임스페이스 자동 생성 실패:")
+            raise HTTPException(status_code=500, detail=f"Namespace 자동 생성 실패: {str(e)}")
 
     try:
         deployment_msg = create_deployment(
@@ -397,7 +700,9 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
             request.file_path,
             request.student_num,
             request.use_vnc,
-            request.use_snapshot
+            request.use_snapshot,
+            request.hw_count,
+            request.prac_count
         )
         service_msg = create_service(
             core_v1_api,

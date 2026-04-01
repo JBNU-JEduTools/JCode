@@ -10,6 +10,9 @@ data:
   SNAPSHOT_NFS_SERVER: "your.nfs.snapshot.server.address"
   SNAPSHOT_NFS_PATH: "/yourSnapshotPath"
   SERVICE_ACCOUNT: "deployment-controller"
+  CODE_SERVER_IMAGE: "code-server:test"
+  CODE_SERVER_VNC_IMAGE: "code-server-vnc:test"
+  IMAGE_PULL_POLICY: "IfNotPresent"
 ---
 apiVersion: v1
 kind: Secret

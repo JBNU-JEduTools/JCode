@@ -16,6 +16,7 @@ RUN sed -i 's|http://deb.debian.org/debian|http://ftp.kr.debian.org/debian|g' /e
 # 필요한 패키지 설치: gcc, python3, python3-pip
 RUN apt-get update && apt-get install --no-install-recommends -y \
     gcc \
+    gdb \
     build-essential \
     libc6-dev \
     python3 \
