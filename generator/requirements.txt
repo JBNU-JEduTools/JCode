@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+python-multipart
 kubernetes
 PyJWT
 python-dotenv

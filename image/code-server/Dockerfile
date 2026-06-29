@@ -1,17 +1,13 @@
 FROM codercom/code-server:4.98.0
 
-LABEL org.opencontainers.image.title="code-server"
-LABEL org.opencontainers.image.description="VS Code(code-server) 환경 이미지"
+LABEL org.opencontainers.image.title="JCode IDE"
+LABEL org.opencontainers.image.description="JCode - 전북대학교 웹 IDE 플랫폼"
 LABEL org.opencontainers.image.authors="OSLAB"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
+LABEL org.opencontainers.image.source="https://github.com/mindungil/JCode-CodeServer"
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
-
-# 미러 서버 변경 (한국 미러: ftp.kr.debian.org)
-RUN sed -i 's|http://deb.debian.org/debian|http://ftp.kr.debian.org/debian|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://deb.debian.org/debian-security|http://ftp.kr.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources
 
 # 필요한 패키지 설치: gcc, python3, python3-pip
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -23,11 +19,32 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# 필요 시 포트 노출 (code-server 기본 포트)
+# ===== JCode UI 커스터마이징 =====
+
+# 1. product.json 교체 (브랜딩: 이름, 텔레메트리 비활성화)
+COPY customization/product.json /usr/lib/code-server/lib/vscode/product.json
+
+# 2. workbench.html 교체 (커스텀 CSS 주입 포인트)
+COPY customization/workbench.html /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html
+
+# 3. 커스텀 CSS (Dracula 테마, 불필요한 UI 숨김)
+COPY customization/jcode.css /usr/lib/code-server/src/browser/media/jcode.css
+
+# 4. 워크스페이스 제한 쉘 스크립트
+COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
+RUN chmod 644 /etc/profile.d/restricted-shell.sh
+
+# 파일 권한 설정
+RUN chown -R 1000:1000 /usr/lib/code-server/lib/vscode/product.json \
+    /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html \
+    /usr/lib/code-server/src/browser/media/jcode.css
+
 EXPOSE 8080
 
-# 기본 사용자로 전환 (code-server 이미지는 기본적으로 'coder' 사용자를 사용)
+# 기본 사용자 설정 (settings.json)
 USER coder
+RUN mkdir -p /home/coder/.local/share/code-server/User
+COPY customization/settings.json /home/coder/.local/share/code-server/User/settings.json
 
-# 기본 CMD는 코드서버 실행 (이미지 기본 ENTRYPOINT/CMD를 그대로 사용 가능)
-CMD ["code-server", "--bind-addr", "0.0.0.0:8080", "--auth", "none"]
+# code-server 실행
+CMD ["code-server", "--bind-addr", "0.0.0.0:8080", "--auth", "none", "--app-name", "JCode IDE", "--welcome-text", "JCode IDE에 오신 것을 환영합니다.", "--disable-getting-started-override", "--disable-workspace-trust"]

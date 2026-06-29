@@ -45,9 +45,13 @@ app.use((req, res, next) => {
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
-// JWT 정보
-const JWT_SECRET = process.env.JWT_SECRET || "ACCESS_SECRET";
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "REFRESH_SECRET";
+// JWT 정보 (미설정 시 기동 차단)
+if (!process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET) {
+  console.error("FATAL: JWT_SECRET, JWT_REFRESH_SECRET 환경 변수가 반드시 설정되어야 합니다.");
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 
 // token refresh 엔드포인트
 const SPRING_REFRESH_URL = process.env.SPRING_REFRESH_URL || "SPRING_REFRESH_URL";
@@ -241,7 +245,7 @@ app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, n
     console.log(`course: ${courseCode}:${clss}, studentEmail: ${studentEmail}, email: ${sub}, role: ${role}`);
     
     // 권한 체크: ADMIN이 아닌 모든 유저는 Redis courseManagerList 또는 본인 이메일로 확인
-    if (!role || !role.includes("ADMIN")) {
+    if (!role || role !== "ADMIN") {
       const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
       if (!isManager && sub !== studentEmail) {
         return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
@@ -414,6 +418,19 @@ server.on('upgrade', async (req, socket, head) => {
       return;
     }
     const { courseCode, clss, email, snapshot } = userProfile;
+
+    // 권한 체크: GET /jcode와 동일한 로직 적용
+    const decoded = jwt.decode(token);
+    const { sub, role } = decoded;
+    if (!role || role !== "ADMIN") {
+      const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+      if (!isManager && sub !== email) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\nNo permission for this project');
+        socket.destroy();
+        return;
+      }
+    }
+
     const redisKeyForTarget = (snapshot === 'true' || snapshot === true)
       ? `user:${email}:course:${courseCode}:${clss}:snapshot`
       : `user:${email}:course:${courseCode}:${clss}`;

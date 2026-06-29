@@ -1,8 +1,11 @@
 import os
+import re
+import shlex
+import stat
 import time
 import logging
 import requests
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -36,9 +39,11 @@ app = FastAPI()
 instrumentator = Instrumentator()
 instrumentator.instrument(app).expose(app, include_in_schema=False, endpoint="/metrics")
 
-# 환경 변수에서 JWT 관련 값 로드
-SECRET_KEY = os.getenv("SECRET_KEY", "secret_key")
-ALGORITHM = os.getenv("ALGORITHM", "alg")
+# 환경 변수에서 JWT 관련 값 로드 (미설정 시 기동 차단)
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM")
+if not SECRET_KEY or not ALGORITHM:
+    raise RuntimeError("SECRET_KEY, ALGORITHM 환경 변수가 반드시 설정되어야 합니다.")
 
 # NFS 서버 정보: 환경 변수로부터 로드
 NFS_SERVER = os.getenv("NFS_SERVER", "nfs_server")
@@ -60,8 +65,9 @@ class DeployRequest(BaseModel):
     student_num: str
     use_vnc: bool
     use_snapshot: bool
-    hw_count: int = Field(default=10, ge=10, le=15)
+    hw_count: int = Field(default=10, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
+    assignment_dirs: list[str] = Field(default=[])
 
 class DeleteRequest(BaseModel):
     namespace: str
@@ -70,6 +76,63 @@ class DeleteRequest(BaseModel):
 
 class NamespaceRequest(BaseModel):
     namespace: str
+
+class ProvisionRequest(BaseModel):
+    namespace: str
+    dir_name: str
+
+
+def validate_workspace_dir_name(dir_name: str) -> str:
+    cleaned = dir_name.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="dir_name은 비어 있을 수 없습니다.")
+    if len(cleaned) > 80:
+        raise HTTPException(status_code=400, detail="dir_name은 80자를 초과할 수 없습니다.")
+    if os.path.isabs(cleaned) or "/" in cleaned or "\\" in cleaned:
+        raise HTTPException(status_code=400, detail="dir_name에는 경로 구분자를 사용할 수 없습니다.")
+    if cleaned in {".", ".."} or any(part == ".." for part in cleaned.split(os.path.sep)):
+        raise HTTPException(status_code=400, detail="dir_name에는 상위 경로 참조를 사용할 수 없습니다.")
+    if re.search(r'[:*?"<>|]', cleaned):
+        raise HTTPException(status_code=400, detail='dir_name에는 : * ? " < > | 문자를 사용할 수 없습니다.')
+    return cleaned
+
+
+def validate_zip_member(info, target_dir: str):
+    raw_name = info.filename
+    normalized = os.path.normpath(raw_name)
+
+    if not raw_name or normalized in {"", "."}:
+        raise HTTPException(status_code=400, detail="zip 파일에 유효하지 않은 경로가 포함되어 있습니다.")
+    if os.path.isabs(raw_name) or normalized.startswith("..") or f"{os.path.sep}.." in normalized:
+        raise HTTPException(status_code=400, detail=f"zip 파일에 상위 경로 참조가 포함되어 있습니다: {raw_name}")
+
+    mode = (info.external_attr >> 16) & 0o777777
+    if stat.S_ISLNK(mode):
+        raise HTTPException(status_code=400, detail=f"zip 파일에 symlink가 포함되어 있습니다: {raw_name}")
+
+    target_root = os.path.realpath(target_dir)
+    target_path = os.path.realpath(os.path.join(target_dir, normalized))
+    if target_path != target_root and not target_path.startswith(target_root + os.sep):
+        raise HTTPException(status_code=400, detail=f"zip 파일 경로가 대상 디렉토리를 벗어납니다: {raw_name}")
+
+
+def safe_extract_zip(zip_file, target_dir: str):
+    max_files = int(os.getenv("STARTER_ZIP_MAX_FILES", "1000"))
+    max_uncompressed = int(os.getenv("STARTER_ZIP_MAX_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
+
+    infos = zip_file.infolist()
+    if len(infos) > max_files:
+        raise HTTPException(status_code=400, detail=f"zip 파일 항목 수가 너무 많습니다: {len(infos)}")
+
+    total_size = 0
+    for info in infos:
+        validate_zip_member(info, target_dir)
+        total_size += info.file_size
+        if total_size > max_uncompressed:
+            raise HTTPException(status_code=400, detail="zip 파일 압축 해제 크기가 허용치를 초과합니다.")
+
+    for info in infos:
+        zip_file.extract(info, target_dir)
 
 # HTTP Bearer 인증 사용
 security = HTTPBearer()
@@ -102,6 +165,9 @@ def load_incluster_config_or_fail():
     except Exception as e:
         logger.exception("인클러스터 구성 로딩 실패:")
         raise Exception("인클러스터 구성이 불가능합니다. 이 API는 인클러스터 환경에서만 실행됩니다.")
+
+# 기동 시 1회 인클러스터 설정 로드
+load_incluster_config_or_fail()
     
 # # --- Prometheus API 모니터링 메트릭 ---
 # http_requests_total = Counter(
@@ -136,7 +202,7 @@ def load_incluster_config_or_fail():
 
 # # ---------------------------------
 
-def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0) -> str:
+def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0, assignment_dirs: list = None) -> str:
     init_volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
@@ -208,8 +274,13 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             )
         )
     else:
-        hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
-        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 else ""
+        if assignment_dirs:
+            safe_dirs = [validate_workspace_dir_name(d) for d in assignment_dirs]
+            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
+            hw_cmd = f"mkdir -p {dirs}"
+        else:
+            hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
+        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 and not assignment_dirs else ""
         base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
             {hw_cmd}{prac_cmd} && \
@@ -363,6 +434,16 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
         raise Exception(f"Service 삭제 중 오류: {str(e)}")
     
 ################ Namespace 관리 함수 ##################
+
+ALLOWED_NS_PATTERN = re.compile(r"^jcode-[a-z0-9]+-\d+$")
+PROTECTED_NAMESPACES = {"default", "kube-system", "kube-public", "kube-node-lease", "ingress-nginx", "monitoring", "watcher"}
+
+def validate_namespace(ns: str):
+    """jcode-{code}-{clss} 패턴만 허용하고, 시스템 NS 조작을 차단합니다."""
+    if ns in PROTECTED_NAMESPACES:
+        raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'�� 조작할 수 없습니다.")
+    if not ALLOWED_NS_PATTERN.match(ns):
+        raise HTTPException(status_code=400, detail=f"네임스��이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일���하지 않습니다: '{ns}'")
 
 GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
 GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
@@ -598,11 +679,7 @@ def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
 @app.post("/api/namespace")
 async def create_namespace_api(request: NamespaceRequest, token_payload: dict = Depends(verify_token)):
     """NS 초기화: Namespace + SA + Role + RoleBinding + ConfigMap + LimitRange + NetworkPolicy"""
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
+    validate_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
@@ -620,11 +697,7 @@ async def create_namespace_api(request: NamespaceRequest, token_payload: dict = 
 @app.delete("/api/namespace/{ns}")
 async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_token)):
     """NS 삭제: 네임스페이스와 내부 모든 리소스를 삭제합니다."""
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
+    validate_namespace(ns)
 
     core_v1_api = client.CoreV1Api()
 
@@ -645,11 +718,7 @@ async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_tok
 @app.delete("/api/namespace/{ns}/resources")
 async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(verify_token)):
     """NS 내 전체 Deployment/Service/Pod 삭제 (NS 자체는 유지)."""
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
+    validate_namespace(ns)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
@@ -669,11 +738,7 @@ async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(
 
 @app.post("/api/jcode")
 async def deploy_resources(request: DeployRequest, token_payload: dict = Depends(verify_token)):
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
+    validate_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
@@ -702,7 +767,8 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
             request.use_vnc,
             request.use_snapshot,
             request.hw_count,
-            request.prac_count
+            request.prac_count,
+            request.assignment_dirs
         )
         service_msg = create_service(
             core_v1_api,
@@ -722,12 +788,8 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
     
 @app.delete("/api/jcode")
 async def delete_resources(request: DeleteRequest, token_payload: dict = Depends(verify_token)):
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
-    
+    validate_namespace(request.namespace)
+
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
@@ -759,6 +821,96 @@ async def delete_resources(request: DeleteRequest, token_payload: dict = Depends
     except Exception as e:
         logger.exception("리소스 삭제 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/workspace/provision")
+async def provision_workspace(request: ProvisionRequest, token_payload: dict = Depends(verify_token)):
+    """과제 생성 시 호출: 해당 과목의 모든 학생 NFS 워크스페이스에 디렉토리 생성"""
+    validate_namespace(request.namespace)
+    dir_name = validate_workspace_dir_name(request.dir_name)
+
+    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
+    class_div = request.namespace.replace("jcode-", "", 1)
+
+    base_path = os.path.join(nfs_mount_path, "workspace")
+    if not os.path.isdir(base_path):
+        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+
+    import glob
+    student_dirs = glob.glob(os.path.join(base_path, f"{class_div}-*"))
+
+    created = 0
+    for student_dir in student_dirs:
+        if not os.path.isdir(student_dir):
+            continue
+        hw_dir = os.path.join(student_dir, dir_name)
+        os.makedirs(hw_dir, exist_ok=True)
+        os.chown(hw_dir, 1000, 1000)
+        created += 1
+
+    logger.info(f"Provisioned '{dir_name}' in {created} student directories for {class_div}")
+    return {"created": created, "dir_name": dir_name}
+
+
+@app.post("/api/workspace/starter-code")
+async def deploy_starter_code(
+    namespace: str = Form(...),
+    dir_name: str = Form(...),
+    file: UploadFile = File(...),
+    token_payload: dict = Depends(verify_token)
+):
+    """스타터 코드 zip 파일을 모든 학생 워크스페이스에 배포"""
+    validate_namespace(namespace)
+    dir_name = validate_workspace_dir_name(dir_name)
+
+    import glob
+    import zipfile
+    import tempfile
+    import shutil
+
+    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
+    class_div = namespace.replace("jcode-", "", 1)
+    base_path = os.path.join(nfs_mount_path, "workspace")
+
+    if not os.path.isdir(base_path):
+        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+
+    content = await file.read()
+    max_zip_bytes = int(os.getenv("STARTER_ZIP_MAX_BYTES", str(50 * 1024 * 1024)))
+    if len(content) > max_zip_bytes:
+        raise HTTPException(status_code=400, detail="zip 파일 크기가 허용치를 초과합니다.")
+
+    # zip 파일을 임시 디렉토리에 저장
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        student_dirs = glob.glob(os.path.join(base_path, f"{class_div}-*"))
+        deployed = 0
+
+        for student_dir in student_dirs:
+            if not os.path.isdir(student_dir):
+                continue
+            target_dir = os.path.join(student_dir, dir_name)
+            os.makedirs(target_dir, exist_ok=True)
+
+            # zip 압축 해제
+            with zipfile.ZipFile(tmp_path, 'r') as zf:
+                safe_extract_zip(zf, target_dir)
+
+            # 소유권 설정
+            for root, dirs, files in os.walk(target_dir):
+                os.chown(root, 1000, 1000)
+                for f in files:
+                    os.chown(os.path.join(root, f), 1000, 1000)
+
+            deployed += 1
+
+        logger.info(f"Deployed starter code to {deployed} directories for {class_div}/{dir_name}")
+        return {"deployed": deployed, "dir_name": dir_name}
+    finally:
+        os.unlink(tmp_path)
+
 
 if __name__ == "__main__":
     import uvicorn
