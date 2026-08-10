@@ -20,12 +20,13 @@ metadata:
     role: jcode
 
 ---
-# 2. 서비스 어카운트 생성 (추후 배포되는 WebIDE 파드가 사용할 계정) => 현재 권한 X
+# 2. WebIDE 파드용 무권한 서비스 어카운트
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: deployment-controller
+  name: jcode-workload
   namespace: ${NAMESPACE}
+automountServiceAccountToken: false
 
 ---
 # 3. Role 생성: ${NAMESPACE} 네임스페이스 내에서 Deployment, Service, ConfigMap, Secret 등에 대한 권한 부여
@@ -43,11 +44,7 @@ rules:
   verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["configmaps"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "list", "watch"]
-  
+  verbs: ["create", "get", "list", "watch", "update", "patch"]
 ---
 # 4. RoleBinding 생성: 위 Role을 서비스 어카운트에 바인딩
 apiVersion: rbac.authorization.k8s.io/v1
@@ -57,7 +54,7 @@ metadata:
   namespace: ${NAMESPACE}
 subjects:
 - kind: ServiceAccount
-  name: jcode-generator
+  name: jcode-workspace
   namespace: watcher
 roleRef:
   kind: Role
@@ -102,9 +99,6 @@ spec:
   podSelector: {}  # 모든 파드에 적용 (필요에 따라 특정 라벨 선택 가능)
   ingress:
   - from:
-    - namespaceSelector:
-        matchLabels:
-          role: jcode  # jcode 네임스페이스에 부여한 라벨
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: watcher

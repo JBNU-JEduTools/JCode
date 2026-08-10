@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: squid-exporter
-        image: boynux/squid-exporter:latest
+        image: harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA
         env:
           - name: SQUID_EXPORTER_LISTEN
             value: ":9308"

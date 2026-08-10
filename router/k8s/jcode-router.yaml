@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: jcode-router
-          image: jcode-router:test
+          image: harbor.jbnu.ac.kr/jdevops/jcode-router:REPLACE_WITH_COMMIT_SHA
           ports:
             - containerPort: 3001  # Node.js 프록시 포트
             - containerPort: 3000  # Squid 프록시 포트 추가

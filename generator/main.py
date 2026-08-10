@@ -5,6 +5,8 @@ import stat
 import time
 import logging
 import requests
+from pathlib import Path
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
@@ -39,24 +41,47 @@ app = FastAPI()
 instrumentator = Instrumentator()
 instrumentator.instrument(app).expose(app, include_in_schema=False, endpoint="/metrics")
 
-# 환경 변수에서 JWT 관련 값 로드 (미설정 시 기동 차단)
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM")
-if not SECRET_KEY or not ALGORITHM:
-    raise RuntimeError("SECRET_KEY, ALGORITHM 환경 변수가 반드시 설정되어야 합니다.")
+# Backend→Generator 전용 자격증명. 사용자 JWT와 키·audience를 공유하지 않는다.
+SERVICE_SECRET = os.getenv("GENERATOR_SERVICE_SECRET")
+SERVICE_ALGORITHM = os.getenv("GENERATOR_SERVICE_ALGORITHM", "HS256")
+SERVICE_ISSUER = os.getenv("GENERATOR_SERVICE_ISSUER", "jcode-backend")
+SERVICE_AUDIENCE = os.getenv("GENERATOR_SERVICE_AUDIENCE", "jcode-generator")
+SERVICE_SUBJECT = os.getenv("GENERATOR_SERVICE_SUBJECT", "jcode-backend")
+if not SERVICE_SECRET or len(SERVICE_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError("GENERATOR_SERVICE_SECRET은 32 byte 이상으로 설정해야 합니다.")
+if SERVICE_ALGORITHM != "HS256":
+    raise RuntimeError("GENERATOR_SERVICE_ALGORITHM은 HS256만 허용합니다.")
 
 # NFS 서버 정보: 환경 변수로부터 로드
-NFS_SERVER = os.getenv("NFS_SERVER", "nfs_server")
-NFS_PATH = os.getenv("NFS_PATH", "nfs_path")
+NFS_SERVER = os.getenv("NFS_SERVER", "")
+NFS_PATH = os.getenv("NFS_PATH", "")
+NFS_MOUNT_PATH = os.getenv("NFS_MOUNT_PATH", "/nfs-data").strip()
 
-SNAPSHOT_NFS_SERVER = os.getenv("SNAPSHOT_NFS_SERVER", "snapshot_nfs_server")
-SNAPSHOT_NFS_PATH = os.getenv("SNAPSHOT_NFS_PATH", "snapshot_nfs_path")
+SNAPSHOT_NFS_SERVER = os.getenv("SNAPSHOT_NFS_SERVER", "")
+SNAPSHOT_NFS_PATH = os.getenv("SNAPSHOT_NFS_PATH", "")
 
 # 서비스 어카운트 고정 (또는 환경 변수로부터 로드)
-SERVICE_ACCOUNT = os.getenv("SERVICE_ACCOUNT", "service_account")
+SERVICE_ACCOUNT = os.getenv("SERVICE_ACCOUNT", "jcode-workload")
+
+WORKSPACE_PROXY_URL = os.getenv("WORKSPACE_PROXY_URL", "").strip()
+WORKSPACE_PROXY_NAMESPACE = os.getenv("WORKSPACE_PROXY_NAMESPACE", "").strip()
+WORKSPACE_PROXY_POD_LABEL = os.getenv("WORKSPACE_PROXY_POD_LABEL", "").strip()
+WORKSPACE_PROXY_PORT = int(os.getenv("WORKSPACE_PROXY_PORT", "3000"))
+WORKSPACE_NO_PROXY = os.getenv(
+    "WORKSPACE_NO_PROXY",
+    "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local",
+).strip()
+
+EXTERNAL_SECRET_STORE_NAME = os.getenv("EXTERNAL_SECRET_STORE_NAME", "").strip()
+EXTERNAL_SECRET_STORE_KIND = os.getenv("EXTERNAL_SECRET_STORE_KIND", "ClusterSecretStore").strip()
+EXTERNAL_SECRET_REFRESH_INTERVAL = os.getenv("EXTERNAL_SECRET_REFRESH_INTERVAL", "1h").strip()
+IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS = int(os.getenv("IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS", "60"))
+NAMESPACE_DELETE_TIMEOUT_SECONDS = int(os.getenv("NAMESPACE_DELETE_TIMEOUT_SECONDS", "60"))
+NAMESPACE_DELETE_POLL_SECONDS = float(os.getenv("NAMESPACE_DELETE_POLL_SECONDS", "2"))
 
 # 요청 바디 모델 정의
 class DeployRequest(BaseModel):
+    course_id: int = Field(gt=0)
     namespace: str
     deployment_name: str
     service_name: str
@@ -70,16 +95,134 @@ class DeployRequest(BaseModel):
     assignment_dirs: list[str] = Field(default=[])
 
 class DeleteRequest(BaseModel):
+    course_id: int = Field(gt=0)
     namespace: str
     deployment_name: str
     service_name: str
 
 class NamespaceRequest(BaseModel):
+    course_id: int = Field(gt=0)
     namespace: str
+    use_vnc: bool = False
 
 class ProvisionRequest(BaseModel):
+    course_id: int = Field(gt=0)
     namespace: str
     dir_name: str
+
+
+def parse_csv_env(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_image_pull_secret_names() -> list[str]:
+    names = parse_csv_env("IMAGE_PULL_SECRET_NAMES")
+    legacy_name = os.getenv("IMAGE_PULL_SECRET_NAME", "").strip()
+    if legacy_name:
+        names.append(legacy_name)
+    return list(dict.fromkeys(names))
+
+
+def get_image_pull_secret_remote_names() -> list[str]:
+    targets = get_image_pull_secret_names()
+    configured = parse_csv_env("IMAGE_PULL_SECRET_REMOTE_NAMES")
+    if not configured:
+        return targets
+    if len(configured) != len(targets):
+        raise RuntimeError("IMAGE_PULL_SECRET_REMOTE_NAMES 수는 IMAGE_PULL_SECRET_NAMES와 같아야 합니다.")
+    return configured
+
+
+def get_workspace_proxy_env() -> list[client.V1EnvVar]:
+    values = {
+        "HTTP_PROXY": WORKSPACE_PROXY_URL,
+        "HTTPS_PROXY": WORKSPACE_PROXY_URL,
+        "http_proxy": WORKSPACE_PROXY_URL,
+        "https_proxy": WORKSPACE_PROXY_URL,
+        "NO_PROXY": WORKSPACE_NO_PROXY,
+        "no_proxy": WORKSPACE_NO_PROXY,
+    }
+    return [client.V1EnvVar(name=name, value=value) for name, value in values.items()]
+
+
+def get_optional_args(name: str) -> Optional[list[str]]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return shlex.split(value)
+
+
+def get_workspace_root() -> str:
+    root = os.getenv("WORKSPACE_ROOT", "/home/coder/project").strip()
+    base_path = Path("/home/coder/project")
+    root_path = Path(root)
+    if not root_path.is_absolute():
+        raise RuntimeError("WORKSPACE_ROOT는 절대 경로여야 합니다.")
+    try:
+        root_path.relative_to(base_path)
+    except ValueError:
+        raise RuntimeError("WORKSPACE_ROOT는 /home/coder/project 하위여야 합니다.")
+    return str(root_path)
+
+
+def build_code_server_args(use_vnc: bool) -> list[str]:
+    configured = (
+        get_optional_args("CODE_SERVER_VNC_ARGS") or get_optional_args("CODE_SERVER_ARGS")
+        if use_vnc
+        else get_optional_args("CODE_SERVER_ARGS")
+    ) or []
+    if not use_vnc:
+        if not any(arg == "--bind-addr" or arg.startswith("--bind-addr=") for arg in configured):
+            configured[0:0] = ["--bind-addr", "0.0.0.0:8080"]
+        if not any(arg == "--auth" or arg.startswith("--auth=") for arg in configured):
+            configured.extend(["--auth", "none"])
+    if "--restrict-workspace-root" not in configured:
+        configured.extend(["--restrict-workspace-root", get_workspace_root()])
+    if get_workspace_root() not in configured:
+        configured.append(get_workspace_root())
+    return configured
+
+
+def get_code_server_args(use_vnc: bool) -> Optional[list[str]]:
+    # VNC image is supervised; its process receives the same arguments through an env var.
+    return None if use_vnc else build_code_server_args(False)
+
+
+def get_code_server_extra_env(use_vnc: bool) -> list[client.V1EnvVar]:
+    workspace_root = get_workspace_root()
+    env = [client.V1EnvVar(name="WORKSPACE_ROOT", value=workspace_root)]
+    if use_vnc:
+        env.append(
+            client.V1EnvVar(
+                name="CODE_SERVER_EXTRA_ARGS",
+                value=shlex.join(build_code_server_args(True)),
+            )
+        )
+    return env
+
+
+def get_immutable_harbor_image(name: str) -> str:
+    image = os.getenv(name, "").strip()
+    if not image:
+        raise RuntimeError(f"{name}를 Harbor 이미지로 설정해야 합니다.")
+    if not image.startswith("harbor.jbnu.ac.kr/"):
+        raise RuntimeError(f"{name}는 harbor.jbnu.ac.kr 이미지여야 합니다: {image}")
+    mutable_tag = image.endswith((":latest", ":test", ":v2", ":v2-test"))
+    digest_pinned = bool(re.search(r"@sha256:[0-9a-f]{64}$", image))
+    commit_tagged = bool(re.search(r":[^/@]*[0-9a-f]{7,40}(?:[-._][^/]*)?$", image))
+    if mutable_tag or not (digest_pinned or commit_tagged):
+        raise RuntimeError(f"{name}는 commit tag 또는 sha256 digest로 고정해야 합니다: {image}")
+    return image
+
+
+def get_code_server_image(use_vnc: bool) -> str:
+    name = "CODE_SERVER_VNC_IMAGE" if use_vnc else "CODE_SERVER_IMAGE"
+    return get_immutable_harbor_image(name)
+
+
+def get_workspace_init_image() -> str:
+    return get_immutable_harbor_image("WORKSPACE_INIT_IMAGE")
 
 
 def validate_workspace_dir_name(dir_name: str) -> str:
@@ -95,6 +238,21 @@ def validate_workspace_dir_name(dir_name: str) -> str:
     if re.search(r'[:*?"<>|]', cleaned):
         raise HTTPException(status_code=400, detail='dir_name에는 : * ? " < > | 문자를 사용할 수 없습니다.')
     return cleaned
+
+
+def get_nfs_workspace_path() -> Path:
+    mount_path = Path(NFS_MOUNT_PATH)
+    if not mount_path.is_absolute():
+        raise RuntimeError("NFS_MOUNT_PATH는 절대 경로여야 합니다.")
+    return mount_path / "workspace"
+
+
+def validate_nfs_mount() -> None:
+    workspace_path = get_nfs_workspace_path()
+    if not workspace_path.is_dir():
+        raise RuntimeError(f"NFS workspace 경로를 찾을 수 없습니다: {workspace_path}")
+    if not os.access(workspace_path, os.R_OK | os.W_OK | os.X_OK):
+        raise RuntimeError(f"NFS workspace 경로에 읽기/쓰기 권한이 없습니다: {workspace_path}")
 
 
 def validate_zip_member(info, target_dir: str):
@@ -137,23 +295,137 @@ def safe_extract_zip(zip_file, target_dir: str):
 # HTTP Bearer 인증 사용
 security = HTTPBearer()
 
+CONTROLLER_MODE = os.getenv("CONTROLLER_MODE", "all").strip().lower()
+if CONTROLLER_MODE not in {"bootstrap", "workspace", "all"}:
+    raise RuntimeError("CONTROLLER_MODE는 bootstrap, workspace, all 중 하나여야 합니다.")
+
+
+def validate_runtime_configuration():
+    if CONTROLLER_MODE in {"workspace", "all"}:
+        required = {
+            "NFS_SERVER": NFS_SERVER,
+            "NFS_PATH": NFS_PATH,
+            "SNAPSHOT_NFS_SERVER": SNAPSHOT_NFS_SERVER,
+            "SNAPSHOT_NFS_PATH": SNAPSHOT_NFS_PATH,
+            "SERVICE_ACCOUNT": SERVICE_ACCOUNT,
+            "GENERATOR_SA_NAME": os.getenv("GENERATOR_SA_NAME", ""),
+            "GENERATOR_SA_NAMESPACE": os.getenv("GENERATOR_SA_NAMESPACE", ""),
+            "WATCHER_NAMESPACE": os.getenv("WATCHER_NAMESPACE", ""),
+            "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
+            "WORKSPACE_PROXY_URL": WORKSPACE_PROXY_URL,
+            "WORKSPACE_PROXY_NAMESPACE": WORKSPACE_PROXY_NAMESPACE,
+            "WORKSPACE_PROXY_POD_LABEL": WORKSPACE_PROXY_POD_LABEL,
+        }
+        missing = [name for name, value in required.items() if not str(value).strip()]
+        if missing:
+            raise RuntimeError(f"Generator 필수 환경값이 누락되었습니다: {', '.join(missing)}")
+        get_code_server_image(False)
+        get_code_server_image(True)
+        get_workspace_init_image()
+        build_code_server_args(False)
+        build_code_server_args(True)
+        validate_nfs_mount()
+    if CONTROLLER_MODE in {"bootstrap", "all"}:
+        required = {
+            "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
+            "EXTERNAL_SECRET_STORE_NAME": EXTERNAL_SECRET_STORE_NAME,
+        }
+        missing = [name for name, value in required.items() if not str(value).strip()]
+        if missing:
+            raise RuntimeError(f"Bootstrap 필수 환경값이 누락되었습니다: {', '.join(missing)}")
+        get_image_pull_secret_remote_names()
+
+
+@app.on_event("startup")
+def validate_on_startup():
+    validate_runtime_configuration()
+
+
+@app.get("/health/live", include_in_schema=False)
+def health_live():
+    return {"status": "UP", "controller": CONTROLLER_MODE}
+
+
+@app.get("/health/ready", include_in_schema=False)
+def health_ready():
+    validate_runtime_configuration()
+    return {"status": "READY", "controller": CONTROLLER_MODE}
+
+
+def require_service_scope(required_scope: str, required_controller: str):
+    """Validate a short-lived Backend service JWT and its operation scope."""
+    def verify_service_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+        if CONTROLLER_MODE not in {required_controller, "all"}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="현재 Controller가 처리하지 않는 작업입니다.",
+            )
+        token = credentials.credentials
+        try:
+            payload = jwt.decode(
+                token,
+                SERVICE_SECRET,
+                algorithms=[SERVICE_ALGORITHM],
+                audience=SERVICE_AUDIENCE,
+                issuer=SERVICE_ISSUER,
+                options={"require": ["exp", "iat", "iss", "aud", "sub", "scope"]},
+            )
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Generator service token이 만료되었습니다.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        except jwt.InvalidTokenError:
+            logger.warning("Generator service token 검증 실패")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Generator service token이 유효하지 않습니다.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if payload.get("sub") != SERVICE_SUBJECT:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="허용되지 않은 호출 주체입니다.")
+
+        issued_at = int(payload["iat"])
+        expires_at = int(payload["exp"])
+        if expires_at - issued_at > 90:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Generator service token 수명이 너무 깁니다.")
+
+        scopes = set(str(payload.get("scope", "")).split())
+        if required_scope not in scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Generator 작업 권한이 없습니다: {required_scope}",
+            )
+        if payload.get("namespace_prefix") != "jcode-":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Namespace 소유 범위가 유효하지 않습니다.")
+        return payload
+
+    return verify_service_token
+
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Deprecated compatibility helper. New endpoints use operation-scoped service auth."""
     token = credentials.credentials
     try:
-        # JWT 디코드: 서명 및 유효성(만료 등) 검증
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except jwt.ExpiredSignatureError as e:
-        logger.exception("토큰 만료 에러:")
+        payload = jwt.decode(
+            token,
+            SERVICE_SECRET,
+            algorithms=[SERVICE_ALGORITHM],
+            audience=SERVICE_AUDIENCE,
+            issuer=SERVICE_ISSUER,
+        )
+    except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="토큰이 만료되었습니다.",
+            detail="Generator service token이 만료되었습니다.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except jwt.InvalidTokenError as e:
-        logger.exception("유효하지 않은 토큰 에러:")
+    except jwt.InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="유효하지 않은 토큰입니다.",
+            detail="Generator service token이 유효하지 않습니다.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return payload
@@ -235,16 +507,21 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                 server=NFS_SERVER,
                 path=NFS_PATH
             )
+        ),
+        client.V1Volume(
+            name="tmp-vol",
+            empty_dir=client.V1EmptyDirVolumeSource(size_limit="1Gi")
         )
     ]
+    volume_mounts.append(client.V1VolumeMount(name="tmp-vol", mount_path="/tmp"))
 
     # 기본 containerPort 리스트
     container_ports = [
         client.V1ContainerPort(container_port=8080)  # 기본적으로 code-server 포트만 설정
     ]
 
-    # 기본 code-server 이미지
-    image_name = os.getenv("CODE_SERVER_IMAGE", "code-server:test")
+    # 커스텀 fork가 들어간 불변 이미지만 허용한다.
+    image_name = get_code_server_image(use_vnc)
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
@@ -312,10 +589,20 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
 
     # VNC를 사용할 경우 추가 설정
     if use_vnc:
-        image_name = os.getenv("CODE_SERVER_VNC_IMAGE", "code-server-vnc:test")
-
         container_ports.append(client.V1ContainerPort(container_port=5901))  # VNC 포트 추가
         container_ports.append(client.V1ContainerPort(container_port=6080))  # noVNC 포트 추가
+
+    image_pull_secret_names = get_image_pull_secret_names()
+    image_pull_secrets = [
+        client.V1LocalObjectReference(name=name)
+        for name in image_pull_secret_names
+    ] or None
+    code_server_args = get_code_server_args(use_vnc)
+    code_server_env = [
+        client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
+        client.V1EnvVar(name="AUTH", value="none"),
+        client.V1EnvVar(name="DISPLAY", value=":1")  # VNC Display 설정
+    ] + get_code_server_extra_env(use_vnc) + get_workspace_proxy_env()
 
     deployment = client.V1Deployment(
         api_version="apps/v1",
@@ -325,13 +612,21 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             replicas=1,
             selector=client.V1LabelSelector(match_labels={"app": app_label}),
             template=client.V1PodTemplateSpec(
-                metadata=client.V1ObjectMeta(labels={"app": app_label}),
+                metadata=client.V1ObjectMeta(
+                    labels={"app": app_label, "jcode/component": "workspace"}
+                ),
                 spec=client.V1PodSpec(
                     service_account_name=SERVICE_ACCOUNT,
+                    automount_service_account_token=False,
+                    security_context=client.V1PodSecurityContext(
+                        seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")
+                    ),
+                    image_pull_secrets=image_pull_secrets,
                     init_containers=[
                         client.V1Container(
                             name="fix-permissions",
-                            image="busybox",
+                            image=get_workspace_init_image(),
+                            image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
                             command=init_command,
                             volume_mounts=init_volume_mounts    # 동적으로 만든 init_volume_mounts 리스트 적용
                         )
@@ -341,12 +636,9 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                             name="code-server",
                             image=image_name,
                             image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
+                            args=code_server_args,
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
-                            env=[
-                                client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
-                                client.V1EnvVar(name="AUTH", value="none"),
-                                client.V1EnvVar(name="DISPLAY", value=":1")  # VNC Display 설정
-                            ],
+                            env=code_server_env,
                             resources=client.V1ResourceRequirements(
                                 requests={"cpu": "200m", "memory": "256Mi"},
                                 limits={"cpu": "4", "memory": "2Gi"}
@@ -354,7 +646,9 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                             volume_mounts=volume_mounts,  # 동적으로 만든 volume_mounts 리스트 적용
                             security_context=client.V1SecurityContext(
                                 run_as_user=1000,
-                                run_as_group=1000
+                                run_as_group=1000,
+                                allow_privilege_escalation=False,
+                                capabilities=client.V1Capabilities(drop=["ALL"]),
                             )
                         )
                     ],
@@ -416,6 +710,8 @@ def delete_deployment(apps_v1_api, namespace: str, deployment_name: str) -> str:
         logger.info(f"Deployment '{deployment_name}' 삭제 완료")
         return f"Deployment '{deployment_name}' 삭제 완료"
     except ApiException as e:
+        if e.status == 404:
+            return f"Deployment '{deployment_name}'는 이미 삭제되었습니다."
         logger.exception("Deployment 삭제 중 오류:")
         raise Exception(f"Deployment 삭제 중 오류: {str(e)}")
 
@@ -430,6 +726,8 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
         logger.info(f"Service '{service_name}' 삭제 완료")
         return f"Service '{service_name}' 삭제 완료"
     except ApiException as e:
+        if e.status == 404:
+            return f"Service '{service_name}'는 이미 삭제되었습니다."
         logger.exception("Service 삭제 중 오류:")
         raise Exception(f"Service 삭제 중 오류: {str(e)}")
     
@@ -441,16 +739,182 @@ PROTECTED_NAMESPACES = {"default", "kube-system", "kube-public", "kube-node-leas
 def validate_namespace(ns: str):
     """jcode-{code}-{clss} 패턴만 허용하고, 시스템 NS 조작을 차단합니다."""
     if ns in PROTECTED_NAMESPACES:
-        raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'�� 조작할 수 없습니다.")
+        raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'는 조작할 수 없습니다.")
     if not ALLOWED_NS_PATTERN.match(ns):
-        raise HTTPException(status_code=400, detail=f"네임스��이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일���하지 않습니다: '{ns}'")
+        raise HTTPException(status_code=400, detail=f"네임스페이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일치하지 않습니다: '{ns}'")
 
-GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
+def ensure_course_metadata(core_v1_api, namespace: str, course_id: int):
+    name = "jcode-course-metadata"
+    expected = {"course-id": str(course_id), "namespace": namespace}
+    try:
+        existing = core_v1_api.read_namespaced_config_map(name=name, namespace=namespace)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        upsert_config_map(core_v1_api, namespace, name, expected)
+        return
+
+    values = existing.data or {}
+    if values.get("course-id") != expected["course-id"] or values.get("namespace") != namespace:
+        raise HTTPException(
+            status_code=409,
+            detail="Namespace가 이미 다른 강의에 연결되어 있어 재초기화할 수 없습니다.",
+        )
+
+
+def verify_course_namespace(core_v1_api, namespace: str, course_id: int):
+    try:
+        metadata = core_v1_api.read_namespaced_config_map(
+            name="jcode-course-metadata",
+            namespace=namespace,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=409, detail="Namespace가 bootstrap되지 않았습니다.")
+        raise
+    values = metadata.data or {}
+    if values.get("course-id") != str(course_id) or values.get("namespace") != namespace:
+        raise HTTPException(status_code=403, detail="courseId와 Namespace 소유 관계가 일치하지 않습니다.")
+
+
+GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-workspace")
 GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
 NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
 WATCHER_NAMESPACE = os.getenv("WATCHER_NAMESPACE", "watcher")
+CONFIG_VERSION = os.getenv("JCODE_CONFIG_VERSION", "2026-08-09")
 
-def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str):
+
+def upsert_config_map(core_v1_api, namespace: str, name: str, data: dict[str, str]):
+    metadata = client.V1ObjectMeta(
+        name=name,
+        namespace=namespace,
+        labels={"app.kubernetes.io/managed-by": "jcode-generator"},
+        annotations={"jcode/config-version": CONFIG_VERSION},
+    )
+    body = client.V1ConfigMap(metadata=metadata, data=data)
+    try:
+        existing = core_v1_api.read_namespaced_config_map(name=name, namespace=namespace)
+        body.metadata.resource_version = existing.metadata.resource_version
+        core_v1_api.replace_namespaced_config_map(name=name, namespace=namespace, body=body)
+        logger.info(f"ConfigMap '{name}' 갱신 완료")
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        core_v1_api.create_namespaced_config_map(namespace=namespace, body=body)
+        logger.info(f"ConfigMap '{name}' 생성 완료")
+
+
+def ensure_code_server_config(core_v1_api, namespace: str):
+    upsert_config_map(
+        core_v1_api,
+        namespace,
+        "code-server-config",
+        {"config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"},
+    )
+
+
+def ensure_watcher_hook_config(core_v1_api, namespace: str):
+    hook_path = Path(os.getenv("WATCHER_HOOK_PATH", Path(__file__).with_name("watcher_hook.py")))
+    upsert_config_map(
+        core_v1_api,
+        namespace,
+        "watcher-hook-config",
+        {"99-watcher-hook.py": hook_path.read_text(encoding="utf-8")},
+    )
+
+
+def ensure_external_image_pull_secrets(custom_objects_api, namespace: str):
+    """Create ExternalSecret declarations without reading registry credentials."""
+    targets = get_image_pull_secret_names()
+    remotes = get_image_pull_secret_remote_names()
+    for target_name, remote_name in zip(targets, remotes):
+        external_secret_name = f"{target_name}-sync"
+        body = {
+            "apiVersion": "external-secrets.io/v1",
+            "kind": "ExternalSecret",
+            "metadata": {
+                "name": external_secret_name,
+                "namespace": namespace,
+                "labels": {"app.kubernetes.io/managed-by": "jcode-generator"},
+            },
+            "spec": {
+                "refreshInterval": EXTERNAL_SECRET_REFRESH_INTERVAL,
+                "secretStoreRef": {
+                    "name": EXTERNAL_SECRET_STORE_NAME,
+                    "kind": EXTERNAL_SECRET_STORE_KIND,
+                },
+                "target": {
+                    "name": target_name,
+                    "creationPolicy": "Owner",
+                    "template": {"type": "kubernetes.io/dockerconfigjson"},
+                },
+                "dataFrom": [{"extract": {"key": remote_name}}],
+            },
+        }
+        try:
+            custom_objects_api.get_namespaced_custom_object(
+                group="external-secrets.io",
+                version="v1",
+                namespace=namespace,
+                plural="externalsecrets",
+                name=external_secret_name,
+            )
+            custom_objects_api.patch_namespaced_custom_object(
+                group="external-secrets.io",
+                version="v1",
+                namespace=namespace,
+                plural="externalsecrets",
+                name=external_secret_name,
+                body=body,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            custom_objects_api.create_namespaced_custom_object(
+                group="external-secrets.io",
+                version="v1",
+                namespace=namespace,
+                plural="externalsecrets",
+                body=body,
+            )
+        logger.info("ExternalSecret '%s' 적용 완료: '%s'.", external_secret_name, namespace)
+
+
+def wait_for_external_image_pull_secrets(custom_objects_api, namespace: str):
+    """Wait for ExternalSecret readiness without reading registry credentials."""
+    secret_names = get_image_pull_secret_names()
+    if not secret_names:
+        raise RuntimeError("IMAGE_PULL_SECRET_NAMES는 최소 1개 이상 설정해야 합니다.")
+    deadline = time.monotonic() + IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS
+    pending = {f"{name}-sync" for name in secret_names}
+    while pending:
+        for external_secret_name in list(pending):
+            try:
+                external_secret = custom_objects_api.get_namespaced_custom_object(
+                    group="external-secrets.io",
+                    version="v1",
+                    namespace=namespace,
+                    plural="externalsecrets",
+                    name=external_secret_name,
+                )
+                conditions = external_secret.get("status", {}).get("conditions", [])
+                if any(
+                    item.get("type") == "Ready" and str(item.get("status")).lower() == "true"
+                    for item in conditions
+                ):
+                    pending.remove(external_secret_name)
+                    logger.info("ExternalSecret '%s' 준비 완료: '%s'.", external_secret_name, namespace)
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+        if pending and time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"ExternalSecret 동기화 시간 초과: Namespace '{namespace}', resources={sorted(pending)}"
+            )
+        if pending:
+            time.sleep(1)
+
+def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api, namespace: str, course_id: int, use_vnc: bool = False):
     """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
 
     # 1. Namespace
@@ -469,19 +933,27 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
         else:
             raise
 
+    ensure_external_image_pull_secrets(custom_objects_api, namespace)
+
     # 2. ServiceAccount
     sa_body = client.V1ServiceAccount(
         metadata=client.V1ObjectMeta(
-            name="deployment-controller",
+            name=SERVICE_ACCOUNT,
             namespace=namespace
-        )
+        ),
+        automount_service_account_token=False,
     )
     try:
         core_v1_api.create_namespaced_service_account(namespace=namespace, body=sa_body)
-        logger.info(f"ServiceAccount 'deployment-controller' 생성 완료")
+        logger.info(f"ServiceAccount '{SERVICE_ACCOUNT}' 생성 완료")
     except ApiException as e:
         if e.status == 409:
-            logger.info(f"ServiceAccount 'deployment-controller'가 이미 존재합니다.")
+            core_v1_api.patch_namespaced_service_account(
+                name=SERVICE_ACCOUNT,
+                namespace=namespace,
+                body=sa_body,
+            )
+            logger.info(f"ServiceAccount '{SERVICE_ACCOUNT}' 갱신 완료")
         else:
             raise
 
@@ -505,12 +977,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             client.V1PolicyRule(
                 api_groups=[""],
                 resources=["configmaps"],
-                verbs=["get", "list", "watch"]
-            ),
-            client.V1PolicyRule(
-                api_groups=[""],
-                resources=["secrets"],
-                verbs=["get", "list", "watch"]
+                verbs=["create", "get", "list", "watch", "update", "patch"]
             ),
         ]
     )
@@ -519,7 +986,12 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
         logger.info(f"Role 'deployment-manager' 생성 완료")
     except ApiException as e:
         if e.status == 409:
-            logger.info(f"Role 'deployment-manager'가 이미 존재합니다.")
+            rbac_v1_api.patch_namespaced_role(
+                name="deployment-manager",
+                namespace=namespace,
+                body=role_body,
+            )
+            logger.info(f"Role 'deployment-manager' 갱신 완료")
         else:
             raise
 
@@ -547,28 +1019,20 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
         logger.info(f"RoleBinding 'deployment-manager-binding' 생성 완료")
     except ApiException as e:
         if e.status == 409:
-            logger.info(f"RoleBinding 'deployment-manager-binding'가 이미 존재합니다.")
+            rbac_v1_api.patch_namespaced_role_binding(
+                name="deployment-manager-binding",
+                namespace=namespace,
+                body=rb_body,
+            )
+            logger.info(f"RoleBinding 'deployment-manager-binding' 갱신 완료")
         else:
             raise
 
     # 5. ConfigMap (code-server-config)
-    cm_body = client.V1ConfigMap(
-        metadata=client.V1ObjectMeta(
-            name="code-server-config",
-            namespace=namespace
-        ),
-        data={
-            "config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"
-        }
-    )
-    try:
-        core_v1_api.create_namespaced_config_map(namespace=namespace, body=cm_body)
-        logger.info(f"ConfigMap 'code-server-config' 생성 완료")
-    except ApiException as e:
-        if e.status == 409:
-            logger.info(f"ConfigMap 'code-server-config'가 이미 존재합니다.")
-        else:
-            raise
+    ensure_code_server_config(core_v1_api, namespace)
+    ensure_course_metadata(core_v1_api, namespace, course_id)
+    if use_vnc:
+        ensure_watcher_hook_config(core_v1_api, namespace)
 
     # 6. LimitRange
     lr_body = client.V1LimitRange(
@@ -608,11 +1072,6 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
                     _from=[
                         client.V1NetworkPolicyPeer(
                             namespace_selector=client.V1LabelSelector(
-                                match_labels={"role": NS_ROLE_LABEL}
-                            )
-                        ),
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
                                 match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
                             )
                         ),
@@ -641,9 +1100,86 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
         else:
             raise
 
+    # Workspace pods may reach DNS and the Watcher API only. In particular they
+    # cannot call the Generator service even though both live in the watcher NS.
+    workspace_egress = client.V1NetworkPolicy(
+        metadata=client.V1ObjectMeta(
+            name="workspace-egress",
+            namespace=namespace,
+        ),
+        spec=client.V1NetworkPolicySpec(
+            pod_selector=client.V1LabelSelector(
+                match_labels={"jcode/component": "workspace"}
+            ),
+            egress=[
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": "kube-system"}
+                            ),
+                            pod_selector=client.V1LabelSelector(
+                                match_labels={"k8s-app": "kube-dns"}
+                            ),
+                        )
+                    ],
+                    ports=[
+                        client.V1NetworkPolicyPort(port=53, protocol="UDP"),
+                        client.V1NetworkPolicyPort(port=53, protocol="TCP"),
+                    ],
+                ),
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
+                            ),
+                            pod_selector=client.V1LabelSelector(
+                                match_labels={"app": "watcher-backend"}
+                            ),
+                        )
+                    ],
+                    ports=[client.V1NetworkPolicyPort(port=3000, protocol="TCP")],
+                ),
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": WORKSPACE_PROXY_NAMESPACE}
+                            ),
+                            pod_selector=client.V1LabelSelector(
+                                match_labels={"app": WORKSPACE_PROXY_POD_LABEL}
+                            ),
+                        )
+                    ],
+                    ports=[client.V1NetworkPolicyPort(port=WORKSPACE_PROXY_PORT, protocol="TCP")],
+                ),
+            ],
+            policy_types=["Egress"],
+        ),
+    )
+    try:
+        networking_v1_api.create_namespaced_network_policy(
+            namespace=namespace,
+            body=workspace_egress,
+        )
+        logger.info(f"NetworkPolicy 'workspace-egress' 생성 완료")
+    except ApiException as e:
+        if e.status == 409:
+            networking_v1_api.patch_namespaced_network_policy(
+                name="workspace-egress",
+                namespace=namespace,
+                body=workspace_egress,
+            )
+            logger.info(f"NetworkPolicy 'workspace-egress' 갱신 완료")
+        else:
+            raise
+
+    wait_for_external_image_pull_secrets(custom_objects_api, namespace)
+
 
 def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
-    """NS 내 모든 Deployment, Service, Pod를 삭제합니다 (NS 자체는 유지)."""
+    """NS 내 Deployment·Service를 삭제한다. Pod는 owner cascade로 정리된다."""
     # Deployment 전체 삭제
     deployments = apps_v1_api.list_namespaced_deployment(namespace=namespace)
     for dep in deployments.items:
@@ -658,9 +1194,7 @@ def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
         core_v1_api.delete_namespaced_service(name=svc.metadata.name, namespace=namespace)
         logger.info(f"Service '{svc.metadata.name}' 삭제 완료")
 
-    # Pod 전체 삭제
-    core_v1_api.delete_collection_namespaced_pod(namespace=namespace)
-    logger.info(f"Namespace '{namespace}'의 모든 Pod 삭제 완료")
+    logger.info(f"Namespace '{namespace}'의 Deployment·Service 삭제 완료")
 
 
 ################ API ##################
@@ -677,7 +1211,10 @@ def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
 #         raise HTTPException(status_code=500, detail="메트릭 생성 중 오류가 발생했습니다.")
 
 @app.post("/api/namespace")
-async def create_namespace_api(request: NamespaceRequest, token_payload: dict = Depends(verify_token)):
+async def create_namespace_api(
+    request: NamespaceRequest,
+    token_payload: dict = Depends(require_service_scope("namespace:write", "bootstrap")),
+):
     """NS 초기화: Namespace + SA + Role + RoleBinding + ConfigMap + LimitRange + NetworkPolicy"""
     validate_namespace(request.namespace)
 
@@ -685,17 +1222,50 @@ async def create_namespace_api(request: NamespaceRequest, token_payload: dict = 
     apps_v1_api = client.AppsV1Api()
     rbac_v1_api = client.RbacAuthorizationV1Api()
     networking_v1_api = client.NetworkingV1Api()
+    custom_objects_api = client.CustomObjectsApi()
 
     try:
-        init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, request.namespace)
+        init_namespace(
+            core_v1_api,
+            apps_v1_api,
+            rbac_v1_api,
+            networking_v1_api,
+            custom_objects_api,
+            request.namespace,
+            request.course_id,
+            request.use_vnc,
+        )
         return {"msg": f"Namespace '{request.namespace}' 초기화 완료"}
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def wait_for_namespace_deleted(
+    core_v1_api,
+    namespace: str,
+    timeout_seconds: int = NAMESPACE_DELETE_TIMEOUT_SECONDS,
+    poll_seconds: float = NAMESPACE_DELETE_POLL_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            core_v1_api.read_namespace(name=namespace)
+        except ApiException as error:
+            if error.status == 404:
+                return True
+            raise
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_seconds)
+
+
 @app.delete("/api/namespace/{ns}")
-async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_token)):
+async def delete_namespace_api(
+    ns: str,
+    course_id: int,
+    token_payload: dict = Depends(require_service_scope("namespace:delete", "bootstrap")),
+):
     """NS 삭제: 네임스페이스와 내부 모든 리소스를 삭제합니다."""
     validate_namespace(ns)
 
@@ -703,21 +1273,37 @@ async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_tok
 
     try:
         core_v1_api.read_namespace(name=ns)
-    except ApiException:
-        raise HTTPException(status_code=404, detail=f"Namespace '{ns}'가 존재하지 않습니다.")
+    except ApiException as e:
+        if e.status == 404:
+            return {"msg": f"Namespace '{ns}'는 이미 삭제되었습니다.", "deleted": True}
+        raise
+
+    verify_course_namespace(core_v1_api, ns, course_id)
 
     try:
         core_v1_api.delete_namespace(name=ns)
-        logger.info(f"Namespace '{ns}' 삭제 완료")
-        return {"msg": f"Namespace '{ns}' 삭제 완료"}
+        logger.info("Namespace '%s' 삭제 요청 완료", ns)
+        if not wait_for_namespace_deleted(core_v1_api, ns):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Namespace '{ns}'가 아직 Terminating 상태입니다. 잠시 후 다시 시도해 주세요.",
+            )
+        logger.info("Namespace '%s' 실제 삭제 확인 완료", ns)
+        return {"msg": f"Namespace '{ns}' 삭제 확인 완료", "deleted": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("네임스페이스 삭제 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/namespace/{ns}/resources")
-async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(verify_token)):
-    """NS 내 전체 Deployment/Service/Pod 삭제 (NS 자체는 유지)."""
+async def delete_namespace_resources_api(
+    ns: str,
+    course_id: int,
+    token_payload: dict = Depends(require_service_scope("namespace:resources:delete", "workspace")),
+):
+    """NS 내 Deployment/Service 삭제 (Pod는 owner cascade, NS 자체는 유지)."""
     validate_namespace(ns)
 
     core_v1_api = client.CoreV1Api()
@@ -725,8 +1311,12 @@ async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(
 
     try:
         core_v1_api.read_namespace(name=ns)
-    except ApiException:
-        raise HTTPException(status_code=404, detail=f"Namespace '{ns}'가 존재하지 않습니다.")
+    except ApiException as e:
+        if e.status == 404:
+            return {"msg": f"Namespace '{ns}'의 리소스는 이미 없습니다."}
+        raise
+
+    verify_course_namespace(core_v1_api, ns, course_id)
 
     try:
         delete_all_resources_in_namespace(core_v1_api, apps_v1_api, ns)
@@ -737,24 +1327,27 @@ async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(
 
 
 @app.post("/api/jcode")
-async def deploy_resources(request: DeployRequest, token_payload: dict = Depends(verify_token)):
+async def deploy_resources(
+    request: DeployRequest,
+    token_payload: dict = Depends(require_service_scope("jcode:write", "workspace")),
+):
     validate_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
-    # 네임스페이스 존재 여부 확인 — 없으면 자동 생성
+    # Workspace Controller는 이미 bootstrap된 Namespace의 소유 메타데이터와
+    # 런타임 ConfigMap만 확인한다. Cluster-scoped 리소스는 만지지 않는다.
     try:
-        core_v1_api.read_namespace(name=request.namespace)
-    except ApiException:
-        logger.info(f"Namespace '{request.namespace}'가 없습니다. 자동 생성합니다.")
-        try:
-            rbac_v1_api = client.RbacAuthorizationV1Api()
-            networking_v1_api = client.NetworkingV1Api()
-            init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, request.namespace)
-        except Exception as e:
-            logger.exception("네임스페이스 자동 생성 실패:")
-            raise HTTPException(status_code=500, detail=f"Namespace 자동 생성 실패: {str(e)}")
+        verify_course_namespace(core_v1_api, request.namespace, request.course_id)
+        ensure_code_server_config(core_v1_api, request.namespace)
+        if request.use_vnc:
+            ensure_watcher_hook_config(core_v1_api, request.namespace)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.exception("Workspace Namespace 검증·동기화 실패:")
+        raise HTTPException(status_code=500, detail=f"Namespace 검증 실패: {str(e)}")
 
     try:
         deployment_msg = create_deployment(
@@ -787,21 +1380,23 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.delete("/api/jcode")
-async def delete_resources(request: DeleteRequest, token_payload: dict = Depends(verify_token)):
+async def delete_resources(
+    request: DeleteRequest,
+    token_payload: dict = Depends(require_service_scope("jcode:delete", "workspace")),
+):
     validate_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
+    verify_course_namespace(core_v1_api, request.namespace, request.course_id)
 
     # 네임스페이스 존재 여부 확인
     try:
         core_v1_api.read_namespace(name=request.namespace)
     except ApiException as e:
-        logger.exception("네임스페이스 조회 오류:")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Namespace '{request.namespace}'가 존재하지 않습니다. 관리자에게 문의하세요."
-        )
+        if e.status == 404:
+            return {"msg": f"Namespace '{request.namespace}'와 JCode 리소스는 이미 없습니다."}
+        raise
 
     try:
         # 삭제 시에는 file_path, app_label 등은 사용하지 않고 이름만 사용
@@ -823,17 +1418,22 @@ async def delete_resources(request: DeleteRequest, token_payload: dict = Depends
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/workspace/provision")
-async def provision_workspace(request: ProvisionRequest, token_payload: dict = Depends(verify_token)):
+async def provision_workspace(
+    request: ProvisionRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
     """과제 생성 시 호출: 해당 과목의 모든 학생 NFS 워크스페이스에 디렉토리 생성"""
     validate_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), request.namespace, request.course_id)
     dir_name = validate_workspace_dir_name(request.dir_name)
 
-    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
     class_div = request.namespace.replace("jcode-", "", 1)
 
-    base_path = os.path.join(nfs_mount_path, "workspace")
-    if not os.path.isdir(base_path):
-        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+    base_path = str(get_nfs_workspace_path())
+    try:
+        validate_nfs_mount()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
     import glob
     student_dirs = glob.glob(os.path.join(base_path, f"{class_div}-*"))
@@ -853,13 +1453,15 @@ async def provision_workspace(request: ProvisionRequest, token_payload: dict = D
 
 @app.post("/api/workspace/starter-code")
 async def deploy_starter_code(
+    course_id: int = Form(...),
     namespace: str = Form(...),
     dir_name: str = Form(...),
     file: UploadFile = File(...),
-    token_payload: dict = Depends(verify_token)
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     """스타터 코드 zip 파일을 모든 학생 워크스페이스에 배포"""
     validate_namespace(namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, course_id)
     dir_name = validate_workspace_dir_name(dir_name)
 
     import glob
@@ -867,12 +1469,12 @@ async def deploy_starter_code(
     import tempfile
     import shutil
 
-    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
     class_div = namespace.replace("jcode-", "", 1)
-    base_path = os.path.join(nfs_mount_path, "workspace")
-
-    if not os.path.isdir(base_path):
-        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+    base_path = str(get_nfs_workspace_path())
+    try:
+        validate_nfs_mount()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
     content = await file.read()
     max_zip_bytes = int(os.getenv("STARTER_ZIP_MAX_BYTES", str(50 * 1024 * 1024)))

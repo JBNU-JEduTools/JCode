@@ -1,0 +1,1 @@
+FROM boynux/squid-exporter:v1.13.0@sha256:a955565560feffccdd765da12e046f00f6410404bb9f55a055543602da2e929b

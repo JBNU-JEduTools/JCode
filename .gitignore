@@ -2,6 +2,8 @@
 generator/.env
 generator/docker-compose.yaml
 generator/*.tar
+__pycache__/
+*.py[cod]
 
 ### router ###
 router/dev/

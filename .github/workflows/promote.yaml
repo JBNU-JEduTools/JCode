@@ -1,0 +1,86 @@
+name: Deploy JCode images
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options: [dev]
+      generator_digest:
+        description: "Generator digest verified in dev"
+        required: true
+        type: string
+      router_digest:
+        description: "Router digest verified in dev"
+        required: true
+        type: string
+      code_server_digest:
+        description: "IDE digest verified in dev"
+        required: true
+        type: string
+      code_server_vnc_digest:
+        description: "VNC IDE digest verified in dev"
+        required: true
+        type: string
+      workspace_init_digest:
+        description: "Workspace init digest verified in dev"
+        required: true
+        type: string
+      squid_exporter_digest:
+        description: "Squid exporter digest verified in dev"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-deploy:
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: harbor.jbnu.ac.kr
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Verify immutable artifacts
+        env:
+          GENERATOR_DIGEST: ${{ inputs.generator_digest }}
+          ROUTER_DIGEST: ${{ inputs.router_digest }}
+          CODE_SERVER_DIGEST: ${{ inputs.code_server_digest }}
+          CODE_SERVER_VNC_DIGEST: ${{ inputs.code_server_vnc_digest }}
+          WORKSPACE_INIT_DIGEST: ${{ inputs.workspace_init_digest }}
+          SQUID_EXPORTER_DIGEST: ${{ inputs.squid_exporter_digest }}
+        run: |
+          for entry in \
+            "jcode-generator:${GENERATOR_DIGEST}" \
+            "jcode-router:${ROUTER_DIGEST}" \
+            "code-server:${CODE_SERVER_DIGEST}" \
+            "code-server-vnc:${CODE_SERVER_VNC_DIGEST}" \
+            "workspace-init:${WORKSPACE_INIT_DIGEST}" \
+            "squid-exporter:${SQUID_EXPORTER_DIGEST}"; do
+            component="${entry%%:*}"
+            digest="${entry#*:}"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect "harbor.jbnu.ac.kr/jdevops/${component}@${digest}"
+          done
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      - name: Deploy verified digests
+        env:
+          JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
+          GENERATOR_DIGEST: ${{ inputs.generator_digest }}
+          ROUTER_DIGEST: ${{ inputs.router_digest }}
+          CODE_SERVER_DIGEST: ${{ inputs.code_server_digest }}
+          CODE_SERVER_VNC_DIGEST: ${{ inputs.code_server_vnc_digest }}
+          WORKSPACE_INIT_DIGEST: ${{ inputs.workspace_init_digest }}
+          SQUID_EXPORTER_DIGEST: ${{ inputs.squid_exporter_digest }}
+        run: deploy/deploy.sh

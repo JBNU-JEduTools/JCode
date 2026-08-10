@@ -1,3 +1,10 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jcode-workspace
+  namespace: watcher
+automountServiceAccountToken: true
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,10 +21,13 @@ spec:
       labels:
         app: jcode-generator
     spec:
-      serviceAccountName: jcode-generator  # 설정된 네임스페이스에 배포 권한을 가지는 서비스어카운트 (jcode-init)
+      serviceAccountName: jcode-workspace
+      imagePullSecrets:
+      - name: watcher-harbor-registry-secret
       containers:
       - name: jcode-generator
-        image: jcode-generator:test
+        image: harbor.jbnu.ac.kr/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 5000
         envFrom:
@@ -25,12 +35,36 @@ spec:
             name: jcode-generator-configmap
         - secretRef:
             name: jcode-generator-secret
+        env:
+        - name: CONTROLLER_MODE
+          value: "workspace"
+        - name: NFS_MOUNT_PATH
+          value: "/nfs-data"
+        volumeMounts:
+        - name: workspace-storage
+          mountPath: /nfs-data
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 20
         resources:
           requests:
             cpu: 200m
             memory: 1.5Gi
           limits:
             memory: 2Gi
+      volumes:
+      - name: workspace-storage
+        persistentVolumeClaim:
+          claimName: jcode-vol-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -47,6 +81,25 @@ spec:
   - name: generator
     port: 5000
     targetPort: 5000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jcode-workspace-backend-only
+  namespace: watcher
+spec:
+  podSelector:
+    matchLabels:
+      app: jcode-generator
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: jcode-backend
+    ports:
+    - protocol: TCP
+      port: 5000
+  policyTypes: ["Ingress"]
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor

@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jcode-bootstrap
+  namespace: watcher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jcode-bootstrap
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["create", "get", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["serviceaccounts", "configmaps", "limitranges"]
+  verbs: ["create", "get", "update", "patch"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles", "rolebindings"]
+  verbs: ["create", "get", "update", "patch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["create", "get", "update", "patch"]
+- apiGroups: ["external-secrets.io"]
+  resources: ["externalsecrets"]
+  verbs: ["create", "get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jcode-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: jcode-bootstrap
+  namespace: watcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jcode-bootstrap
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jcode-bootstrap
+  namespace: watcher
+  labels:
+    app: jcode-bootstrap
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jcode-bootstrap
+  template:
+    metadata:
+      labels:
+        app: jcode-bootstrap
+    spec:
+      serviceAccountName: jcode-bootstrap
+      imagePullSecrets:
+      - name: watcher-harbor-registry-secret
+      containers:
+      - name: bootstrap
+        image: harbor.jbnu.ac.kr/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: jcode-generator-configmap
+        - secretRef:
+            name: jcode-generator-secret
+        env:
+        - name: CONTROLLER_MODE
+          value: "bootstrap"
+        ports:
+        - name: http
+          containerPort: 5000
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jcode-bootstrap-svc
+  namespace: watcher
+spec:
+  selector:
+    app: jcode-bootstrap
+  ports:
+  - name: http
+    port: 5000
+    targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jcode-bootstrap-backend-only
+  namespace: watcher
+spec:
+  podSelector:
+    matchLabels:
+      app: jcode-bootstrap
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: jcode-backend
+    ports:
+    - protocol: TCP
+      port: 5000
+  policyTypes: ["Ingress"]

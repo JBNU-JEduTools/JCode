@@ -1,12 +1,11 @@
 # === Builder Stage ===
-FROM codercom/code-server:4.98.0 AS builder
+ARG JCODE_CODE_SERVER_BASE
+FROM ${JCODE_CODE_SERVER_BASE} AS builder
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 미러 서버 변경 (한국 미러: ftp.kr.debian.org)
-RUN sed -i 's|http://deb.debian.org/debian|http://ftp.kr.debian.org/debian|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://deb.debian.org/debian-security|http://ftp.kr.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources
+# 기본 Debian mirror를 사용한다.
 
 # 필수 패키지 설치 (최종 스테이지에서는 runit 대신 supervisord를 사용할 예정)
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -23,13 +22,11 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 RUN echo "exec openbox-session" > ~/.xsession && \
     echo "exec openbox-session" > ~/.xinitrc
 
-# VNC 암호 설정 (비밀번호 "password"로 설정)
-RUN mkdir -p /root/.vnc && \
-    echo "password" | vncpasswd -f > /root/.vnc/passwd && \
-    chmod 600 /root/.vnc/passwd
+# VNC는 ClusterIP + Router 인증 뒤에서만 제공하며 이미지에 공용 비밀번호를 넣지 않는다.
+RUN mkdir -p /root/.vnc
 
 # VNC 서버 실행 테스트 (화면 :1) - 설정 확인용으로 실행 후 종료
-RUN vncserver :1 -geometry 1280x800 -depth 24 -passwd /root/.vnc/passwd && \
+RUN vncserver :1 -geometry 1280x800 -depth 24 -SecurityTypes None && \
     vncserver -kill :1
 
 # VNC 세션에 openbox 실행 (VNC 접속 시 최소한의 창 관리자만 실행)
@@ -49,7 +46,7 @@ RUN mkdir -p /runtime && \
 # supervisord.conf는 나중에 Final Stage에서 복사할 예정이므로 빌더 스테이지에선 생성하지 않아도 됩니다.
 
 # === Final Stage ===
-FROM codercom/code-server:4.98.0
+FROM ${JCODE_CODE_SERVER_BASE}
 
 LABEL org.opencontainers.image.title="code-server-vnc"
 LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc 환경 이미지"
@@ -60,9 +57,7 @@ LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 미러 서버 변경 (한국 미러: ftp.kr.debian.org)
-RUN sed -i 's|http://deb.debian.org/debian|http://ftp.kr.debian.org/debian|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://deb.debian.org/debian-security|http://ftp.kr.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources
+# 기본 Debian mirror를 사용한다.
 
 # 최종 이미지에서는 빌더에서 설정한 내용만 복사 (필요한 런타임 설정 파일)
 COPY --from=builder /runtime/ /runtime/
@@ -84,7 +79,17 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential \
     libc6-dev \
     supervisor \
-    netcat-openbsd && \
+    netcat-openbsd \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-xinerama0 \
+    libxcb-xkb1 \
+    libxkbcommon-x11-0 \
+    libxkbcommon0 \
+    fonts-nanum && \
     rm -rf /var/lib/apt/lists/*
 
 # coder 유저의 pip 설정 추가 (break-system-packages)
@@ -116,8 +121,12 @@ RUN cp -r /runtime/.vnc /home/coder/ && \
     chown -R 1000:1000 /home/coder && \
     chown -R 1000:1000 /home/coder/.ipython/profile_default/startup
 
-# supervisord.conf 복사 (Docker build 컨텍스트 내 supervisor 디렉토리에 위치)
-COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+# 환경별 비밀값이 없는 재현 가능한 기본 supervisor 설정
+COPY supervisor/supervisord.default.conf /etc/supervisor/supervisord.conf
+
+# UX guard only. The actual boundary is the Pod security context and NFS mount.
+COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
+RUN chmod 644 /etc/profile.d/restricted-shell.sh
 
 # 포트 개방 (code-server:8080, VNC:5900~5910, websockify(noVNC):6080~6100)
 EXPOSE 8080 5900-5910 6080-6100

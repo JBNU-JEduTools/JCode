@@ -1,4 +1,5 @@
-FROM codercom/code-server:4.98.0
+ARG JCODE_CODE_SERVER_BASE
+FROM ${JCODE_CODE_SERVER_BASE}
 
 LABEL org.opencontainers.image.title="JCode IDE"
 LABEL org.opencontainers.image.description="JCode - 전북대학교 웹 IDE 플랫폼"

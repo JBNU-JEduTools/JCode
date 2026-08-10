@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture()
 def generator(monkeypatch):
-    monkeypatch.setenv("SECRET_KEY", "test-secret")
-    monkeypatch.setenv("ALGORITHM", "HS256")
+    monkeypatch.setenv("GENERATOR_SERVICE_SECRET", "0123456789abcdef0123456789abcdef")
+    monkeypatch.setenv("CONTROLLER_MODE", "all")
     monkeypatch.setattr(config, "load_incluster_config", lambda: None)
     module = importlib.import_module("main")
     return importlib.reload(module)

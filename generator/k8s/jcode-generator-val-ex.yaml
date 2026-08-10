@@ -7,15 +7,35 @@ data:
   ALGORITHM: "HS256"
   NFS_SERVER: "your.nfs.server.address"
   NFS_PATH: "/yourPath"
+  NFS_MOUNT_PATH: "/nfs-data"
   SNAPSHOT_NFS_SERVER: "your.nfs.snapshot.server.address"
   SNAPSHOT_NFS_PATH: "/yourSnapshotPath"
-  SERVICE_ACCOUNT: "deployment-controller"
-  CODE_SERVER_IMAGE: "code-server:test"
-  CODE_SERVER_VNC_IMAGE: "code-server-vnc:test"
+  SERVICE_ACCOUNT: "jcode-workload"
+  CODE_SERVER_IMAGE: "harbor.jbnu.ac.kr/jdevops/code-server:0123456789abcdef"
+  CODE_SERVER_VNC_IMAGE: "harbor.jbnu.ac.kr/jdevops/code-server-vnc:0123456789abcdef"
+  WORKSPACE_INIT_IMAGE: "harbor.jbnu.ac.kr/jdevops/workspace-init:0123456789abcdef"
   IMAGE_PULL_POLICY: "IfNotPresent"
+  IMAGE_PULL_SECRET_NAMES: "watcher-harbor-registry-secret"
+  IMAGE_PULL_SECRET_REMOTE_NAMES: "watcher-harbor-registry-secret"
+  EXTERNAL_SECRET_STORE_NAME: "jcode-harbor-pull-secret"
+  EXTERNAL_SECRET_STORE_KIND: "ClusterSecretStore"
+  IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS: "60"
+  CODE_SERVER_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
+  CODE_SERVER_VNC_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
+  WORKSPACE_ROOT: "/home/coder/project"
+  GENERATOR_SA_NAME: "jcode-workspace"
+  GENERATOR_SA_NAMESPACE: "watcher"
+  WATCHER_NAMESPACE: "watcher"
+  WORKSPACE_PROXY_URL: "http://jcode-router-svc.watcher.svc.cluster.local:3000"
+  WORKSPACE_PROXY_NAMESPACE: "watcher"
+  WORKSPACE_PROXY_POD_LABEL: "jcode-router"
+  WORKSPACE_PROXY_PORT: "3000"
+  WORKSPACE_NO_PROXY: "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local"
   STARTER_ZIP_MAX_BYTES: "52428800"
   STARTER_ZIP_MAX_UNCOMPRESSED_BYTES: "209715200"
   STARTER_ZIP_MAX_FILES: "1000"
+  NAMESPACE_DELETE_TIMEOUT_SECONDS: "60"
+  NAMESPACE_DELETE_POLL_SECONDS: "2"
 ---
 apiVersion: v1
 kind: Secret
@@ -24,4 +44,4 @@ metadata:
   namespace: watcher
 type: Opaque
 data:
-  SECRET_KEY: "WU9VUl9TRUNSRVRfS0VZX0JBU0U2NA==" # ("YOUR_SECRET_KEY_BASE64")
+  GENERATOR_SERVICE_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" # 32-byte example; replace through Secret manager

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "environment": "dev",
+  "jcode_ref": "0123456789abcdef0123456789abcdef01234567",
+  "watcher_ref": "89abcdef0123456789abcdef0123456789abcdef",
+  "digests": {
+    "watcher_backend": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "watcher_filemon": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "watcher_procmon": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "generator": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "router": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "code_server": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "code_server_vnc": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "workspace_init": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "squid_exporter": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "backend": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "frontend": "sha256:REPLACE_WITH_VERIFIED_DIGEST"
+  }
+}

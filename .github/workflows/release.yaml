@@ -1,0 +1,198 @@
+name: Deploy platform release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options: [dev, production]
+      digests:
+        description: "Dev only: JSON containing the eleven image digests"
+        required: false
+        type: string
+      watcher_ref:
+        description: "Dev only: full Watcher commit SHA"
+        required: false
+        type: string
+      dev_run_id:
+        description: "Production only: successful dev release run ID"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: jcode-platform-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-in-order:
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.target }}
+    steps:
+      - name: Create dev release manifest
+        if: inputs.target == 'dev'
+        env:
+          RELEASE_DIGESTS: ${{ inputs.digests }}
+          WATCHER_REF_INPUT: ${{ inputs.watcher_ref }}
+        run: |
+          [[ "$WATCHER_REF_INPUT" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$RELEASE_DIGESTS"
+          mkdir -p "$RUNNER_TEMP/release-input"
+          jq -n \
+            --arg jcode_ref "$GITHUB_SHA" \
+            --arg watcher_ref "$WATCHER_REF_INPUT" \
+            --argjson digests "$RELEASE_DIGESTS" \
+            '{schema:1,environment:"dev",jcode_ref:$jcode_ref,watcher_ref:$watcher_ref,digests:$digests}' \
+            > "$RUNNER_TEMP/release-input/release-manifest.json"
+      - name: Validate successful dev run
+        if: inputs.target == 'production'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = Number('${{ inputs.dev_run_id }}');
+            if (!Number.isSafeInteger(runId) || runId <= 0) {
+              core.setFailed('dev_run_id must be a positive workflow run ID');
+              return;
+            }
+            const {data: run} = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            if (run.event !== 'workflow_dispatch' || run.path !== '.github/workflows/release.yaml' || run.conclusion !== 'success') {
+              core.setFailed('production requires a successful dev run of release.yaml');
+            }
+      - name: Download dev release manifest
+        if: inputs.target == 'production'
+        uses: actions/download-artifact@v4
+        with:
+          name: jcode-release-manifest
+          path: ${{ runner.temp }}/release-input
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.dev_run_id }}
+          github-token: ${{ github.token }}
+      - name: Load immutable release manifest
+        run: |
+          manifest="$RUNNER_TEMP/release-input/release-manifest.json"
+          test -f "$manifest"
+          jq -e '
+            .schema == 1 and
+            .environment == "dev" and
+            (.digests | type == "object" and length == 11)
+          ' "$manifest" >/dev/null
+
+          jcode_ref=$(jq -er '.jcode_ref' "$manifest")
+          watcher_ref=$(jq -er '.watcher_ref' "$manifest")
+          [[ "$jcode_ref" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$watcher_ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "JCODE_REF=$jcode_ref" >> "$GITHUB_ENV"
+          echo "WATCHER_REF=$watcher_ref" >> "$GITHUB_ENV"
+
+          for mapping in \
+            "WATCHER_BACKEND_DIGEST:watcher_backend" \
+            "WATCHER_FILEMON_DIGEST:watcher_filemon" \
+            "WATCHER_PROCMON_DIGEST:watcher_procmon" \
+            "GENERATOR_DIGEST:generator" \
+            "ROUTER_DIGEST:router" \
+            "CODE_SERVER_DIGEST:code_server" \
+            "CODE_SERVER_VNC_DIGEST:code_server_vnc" \
+            "WORKSPACE_INIT_DIGEST:workspace_init" \
+            "SQUID_EXPORTER_DIGEST:squid_exporter" \
+            "BACKEND_DIGEST:backend" \
+            "FRONTEND_DIGEST:frontend"; do
+            variable="${mapping%%:*}"
+            key="${mapping#*:}"
+            digest=$(jq -er --arg key "$key" '.digests[$key]' "$manifest")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            echo "${variable}=${digest}" >> "$GITHUB_ENV"
+          done
+          echo "RELEASE_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Checkout JCode release code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.JCODE_REF }}
+      - name: Checkout Watcher release code
+        uses: actions/checkout@v4
+        with:
+          repository: mindungil/JCode-Watcher
+          ref: ${{ env.WATCHER_REF }}
+          path: release/watcher
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: harbor.jbnu.ac.kr
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Verify release artifacts
+        run: |
+          for entry in \
+            "jdevops|watcher-backend|${WATCHER_BACKEND_DIGEST}" \
+            "jdevops|watcher-filemon|${WATCHER_FILEMON_DIGEST}" \
+            "jdevops|watcher-procmon|${WATCHER_PROCMON_DIGEST}" \
+            "jdevops|jcode-generator|${GENERATOR_DIGEST}" \
+            "jdevops|jcode-router|${ROUTER_DIGEST}" \
+            "jdevops|code-server|${CODE_SERVER_DIGEST}" \
+            "jdevops|code-server-vnc|${CODE_SERVER_VNC_DIGEST}" \
+            "jdevops|workspace-init|${WORKSPACE_INIT_DIGEST}" \
+            "jdevops|squid-exporter|${SQUID_EXPORTER_DIGEST}" \
+            "jdevops|jcode-backend|${BACKEND_DIGEST}" \
+            "jsh2256|jcode-front|${FRONTEND_DIGEST}"; do
+            IFS='|' read -r project component digest <<< "$entry"
+            docker buildx imagetools inspect "harbor.jbnu.ac.kr/${project}/${component}@${digest}"
+          done
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      - name: Deploy Watcher first
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          cd release/watcher
+          python deploy/set-image-digests.py "$TARGET" \
+            "$WATCHER_BACKEND_DIGEST" \
+            "$WATCHER_FILEMON_DIGEST" \
+            "$WATCHER_PROCMON_DIGEST"
+          deploy/deploy.sh "$TARGET"
+      - name: Deploy Generator and Router second
+        env:
+          JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
+        run: deploy/deploy.sh
+      - name: Deploy portal Backend third
+        env:
+          KUBE_NAMESPACE: ${{ vars.BACKEND_NAMESPACE }}
+          KUBE_DEPLOYMENT: ${{ vars.BACKEND_DEPLOYMENT }}
+          KUBE_CONTAINER: ${{ vars.BACKEND_CONTAINER }}
+        run: |
+          : "${KUBE_NAMESPACE:?BACKEND_NAMESPACE environment variable is required}"
+          : "${KUBE_DEPLOYMENT:?BACKEND_DEPLOYMENT environment variable is required}"
+          : "${KUBE_CONTAINER:?BACKEND_CONTAINER environment variable is required}"
+          image="harbor.jbnu.ac.kr/jdevops/jcode-backend@${BACKEND_DIGEST}"
+          kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
+          kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
+      - name: Deploy Frontend last
+        env:
+          KUBE_NAMESPACE: ${{ vars.FRONTEND_NAMESPACE }}
+          KUBE_DEPLOYMENT: ${{ vars.FRONTEND_DEPLOYMENT }}
+          KUBE_CONTAINER: ${{ vars.FRONTEND_CONTAINER }}
+        run: |
+          : "${KUBE_NAMESPACE:?FRONTEND_NAMESPACE environment variable is required}"
+          : "${KUBE_DEPLOYMENT:?FRONTEND_DEPLOYMENT environment variable is required}"
+          : "${KUBE_CONTAINER:?FRONTEND_CONTAINER environment variable is required}"
+          image="harbor.jbnu.ac.kr/jsh2256/jcode-front@${FRONTEND_DIGEST}"
+          kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
+          kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
+      - name: Publish dev release manifest
+        if: inputs.target == 'dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jcode-release-manifest
+          path: ${{ runner.temp }}/release-input/release-manifest.json
+          if-no-files-found: error
+          retention-days: 30

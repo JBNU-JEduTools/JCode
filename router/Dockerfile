@@ -14,16 +14,36 @@ FROM node:18-alpine
 WORKDIR /app
 
 # Squid 및 필수 패키지 설치
-RUN echo "http://mirror.xtom.com.hk/alpine/latest-stable/main" > /etc/apk/repositories \
-    && apk update \
-    && apk add squid supervisor \
-    && rm -rf /var/cache/apk/*
+RUN apk add --no-cache squid supervisor
 
-# Squid 설정 파일 복사
-COPY squid/squid.conf /etc/squid/squid.conf
+# 실행 환경은 Squid ConfigMap을 마운트한다. 이미지 단독 실행 시에는 deny-all을 기본값으로 사용한다.
+RUN printf '%s\n' \
+    'http_port 3000' \
+    'http_access deny all' \
+    'cache deny all' \
+    'cache_dir null /dev/null' \
+    'cache_mem 0 MB' \
+    > /etc/squid/squid.conf
 
-# Supervisor 설정 파일 복사
-COPY supervisor/supervisord.conf /etc/supervisord.conf
+# 환경별 값이 없는 공통 supervisor 설정은 이미지에 포함한다.
+RUN printf '%s\n' \
+    '[supervisord]' \
+    'nodaemon=true' \
+    '' \
+    '[program:squid]' \
+    'command=/usr/sbin/squid -N -f /etc/squid/squid.conf' \
+    'autostart=true' \
+    'autorestart=true' \
+    'stderr_logfile=/var/log/squid.err.log' \
+    'stdout_logfile=/var/log/squid.out.log' \
+    '' \
+    '[program:node]' \
+    'command=node /app/server.js' \
+    'autostart=true' \
+    'autorestart=true' \
+    'stderr_logfile=/var/log/node.err.log' \
+    'stdout_logfile=/var/log/node.out.log' \
+    > /etc/supervisord.conf
 
 # 빌드된 Node.js 의존성 복사
 COPY --from=build /app/node_modules /app/node_modules

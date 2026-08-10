@@ -63,9 +63,14 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://localhost";
 // REDIS 정보
 const REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT) || 6379;
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD || "";
 
 // Redis
-const redisClient = redis.createClient({ socket: { host: REDIS_HOST, port: REDIS_PORT }});
+const redisOptions = { socket: { host: REDIS_HOST, port: REDIS_PORT }};
+if (REDIS_PASSWORD) {
+  redisOptions.password = REDIS_PASSWORD;
+}
+const redisClient = redis.createClient(redisOptions);
 redisClient.on('error', (err) => {
   console.error('Redis Client Error:', err);
 });

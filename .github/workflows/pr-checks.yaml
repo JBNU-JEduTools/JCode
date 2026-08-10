@@ -1,0 +1,46 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  generator:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: generator/requirements.txt
+      - run: python -m pip install -r generator/requirements.txt pytest
+      - run: python -m pytest -q generator/tests
+      - name: Validate manifests and shell
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in Path("generator/k8s").glob("*.yaml"):
+              list(yaml.safe_load_all(path.read_text()))
+          PY
+          bash -n generator/k8s/jcode-init.sh
+          bash -n generator/k8s/bootstrap-prerequisites.sh
+          bash -n generator/k8s/configure-workspace-storage.sh
+          bash -n router/k8s/configure-squid.sh
+          bash -n deploy/deploy.sh
+      - name: Verify Generator workspace mount
+        run: |
+          grep -q 'name: NFS_MOUNT_PATH' generator/k8s/jcode-generator.yaml
+          grep -q 'mountPath: /nfs-data' generator/k8s/jcode-generator.yaml
+          grep -q 'claimName: jcode-vol-pvc' generator/k8s/jcode-generator.yaml
+          if grep -R -q '{{HTTP_PORT}}\|{{ALLOWED_NETWORK_CIDR}}' router/k8s; then exit 1; fi
+          if grep -R -nE '(^|[[:space:]])image:[[:space:]]+([^/[:space:]]+/)?[^[:space:]]+:latest|image="busybox"' generator router; then exit 1; fi
+          grep -q 'WORKSPACE_INIT_IMAGE' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'volumeHandle' generator/k8s/configure-workspace-storage.sh
+          grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' router/k8s/squid-exporter.yaml
+          jq -e '.schema == 1 and .environment == "dev" and (.digests | length == 11)' deploy/release-manifest.example.json >/dev/null

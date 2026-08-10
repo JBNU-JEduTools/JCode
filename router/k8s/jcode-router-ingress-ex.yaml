@@ -12,10 +12,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - {{ host }}
-      secretName: {{ tls-seret }}
+        - jcode.example.com
+      secretName: jcode-router-tls
   rules:
-    - host: {{ host }}
+    - host: jcode.example.com
       http:
         paths:
           - path: /jcode
@@ -25,9 +25,6 @@ spec:
                 name: jcode-router-svc
                 port:
                   number: 3001
-    - host: {{ host }}
-      http:
-        paths:
           - path: /jcode-logout
             pathType: Prefix
             backend:
@@ -35,9 +32,6 @@ spec:
                 name: jcode-router-svc
                 port:
                   number: 3001
-    - host: {{ host }}
-      http:
-        paths:
           - path: /websockify
             pathType: Prefix
             backend:

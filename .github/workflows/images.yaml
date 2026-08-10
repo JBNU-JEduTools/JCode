@@ -1,0 +1,50 @@
+name: JCode runtime images
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: harbor.jbnu.ac.kr
+  PROJECT: jdevops
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - component: jcode-generator
+            context: generator
+          - component: jcode-router
+            context: router
+          - component: workspace-init
+            context: image/workspace-init
+          - component: squid-exporter
+            context: image/squid-exporter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to Harbor
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Build immutable image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.component }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+      - name: Record digest
+        run: echo '${{ matrix.component }}=${{ steps.image.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
