@@ -1,42 +1,8 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: jcode-bootstrap
+  name: jcode-bootstrap-v2
   namespace: watcher
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: jcode-bootstrap
-rules:
-- apiGroups: [""]
-  resources: ["namespaces"]
-  verbs: ["create", "get", "patch", "delete"]
-- apiGroups: [""]
-  resources: ["serviceaccounts", "configmaps", "limitranges"]
-  verbs: ["create", "get", "update", "patch"]
-- apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["roles", "rolebindings"]
-  verbs: ["create", "get", "update", "patch"]
-- apiGroups: ["networking.k8s.io"]
-  resources: ["networkpolicies"]
-  verbs: ["create", "get", "update", "patch"]
-- apiGroups: ["external-secrets.io"]
-  resources: ["externalsecrets"]
-  verbs: ["create", "get", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: jcode-bootstrap
-subjects:
-- kind: ServiceAccount
-  name: jcode-bootstrap
-  namespace: watcher
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: jcode-bootstrap
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -55,7 +21,10 @@ spec:
       labels:
         app: jcode-bootstrap
     spec:
-      serviceAccountName: jcode-bootstrap
+      serviceAccountName: jcode-bootstrap-v2
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       imagePullSecrets:
       - name: watcher-harbor-registry-secret
       containers:
@@ -70,9 +39,29 @@ spec:
         env:
         - name: CONTROLLER_MODE
           value: "bootstrap"
+        - name: JCODE_ENVIRONMENT
+          value: "prod"
+        - name: REQUEST_NAMESPACE_PREFIX
+          value: "jcode-"
+        - name: COURSE_NAMESPACE_PREFIX
+          value: "jcode-"
+        - name: WORKSPACE_CONTROLLER_SA
+          value: "jcode-workspace-v2"
+        - name: WORKSPACE_RUNTIME_CLUSTER_ROLE
+          value: "jcode-workspace-runtime-v2"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         ports:
         - name: http
           containerPort: 5000
+        startupProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          periodSeconds: 5
+          failureThreshold: 36
         readinessProbe:
           httpGet:
             path: /health/ready
@@ -88,6 +77,11 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
 ---
 apiVersion: v1
 kind: Service

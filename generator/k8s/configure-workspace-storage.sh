@@ -3,6 +3,7 @@ set -euo pipefail
 
 namespace=${JCODE_NAMESPACE:-watcher}
 pvc_name=${WORKSPACE_PVC_NAME:-jcode-vol-pvc}
+configmap_name=${GENERATOR_CONFIGMAP_NAME:-jcode-generator-configmap}
 
 kubectl wait -n "$namespace" \
   --for=jsonpath='{.status.phase}'=Bound \
@@ -31,9 +32,9 @@ patch=$(jq -n \
   --arg server "$nfs_server" \
   --arg path "$nfs_path" \
   '{data:{NFS_SERVER:$server,NFS_PATH:$path,NFS_MOUNT_PATH:"/nfs-data"}}')
-kubectl patch configmap jcode-generator-configmap \
+kubectl patch configmap "$configmap_name" \
   -n "$namespace" \
   --type=merge \
   --patch "$patch"
 
-echo "Configured ${namespace}/jcode-generator-configmap from ${namespace}/${pvc_name}"
+echo "Configured ${namespace}/${configmap_name} from ${namespace}/${pvc_name}"

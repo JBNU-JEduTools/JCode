@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shlex
@@ -78,6 +79,47 @@ EXTERNAL_SECRET_REFRESH_INTERVAL = os.getenv("EXTERNAL_SECRET_REFRESH_INTERVAL",
 IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS = int(os.getenv("IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS", "60"))
 NAMESPACE_DELETE_TIMEOUT_SECONDS = int(os.getenv("NAMESPACE_DELETE_TIMEOUT_SECONDS", "60"))
 NAMESPACE_DELETE_POLL_SECONDS = float(os.getenv("NAMESPACE_DELETE_POLL_SECONDS", "2"))
+
+
+def get_workspace_node_selector() -> Optional[dict[str, str]]:
+    raw = os.getenv("WORKSPACE_NODE_SELECTOR", "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("WORKSPACE_NODE_SELECTOR는 JSON object여야 합니다.") from exc
+    if not isinstance(value, dict) or not value or not all(
+        isinstance(key, str) and key and isinstance(item, str) and item
+        for key, item in value.items()
+    ):
+        raise RuntimeError("WORKSPACE_NODE_SELECTOR에는 비어 있지 않은 문자열 key/value가 필요합니다.")
+    return value
+
+
+def get_workspace_tolerations() -> Optional[list[client.V1Toleration]]:
+    raw = os.getenv("WORKSPACE_TOLERATIONS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("WORKSPACE_TOLERATIONS는 JSON array여야 합니다.") from exc
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise RuntimeError("WORKSPACE_TOLERATIONS는 object로 구성된 JSON array여야 합니다.")
+    allowed = {"key", "operator", "value", "effect", "tolerationSeconds"}
+    if any(set(item) - allowed for item in value):
+        raise RuntimeError("WORKSPACE_TOLERATIONS에 허용되지 않은 필드가 있습니다.")
+    return [
+        client.V1Toleration(
+            key=item.get("key"),
+            operator=item.get("operator"),
+            value=item.get("value"),
+            effect=item.get("effect"),
+            toleration_seconds=item.get("tolerationSeconds"),
+        )
+        for item in value
+    ] or None
 
 # 요청 바디 모델 정의
 class DeployRequest(BaseModel):
@@ -295,21 +337,19 @@ def safe_extract_zip(zip_file, target_dir: str):
 # HTTP Bearer 인증 사용
 security = HTTPBearer()
 
-CONTROLLER_MODE = os.getenv("CONTROLLER_MODE", "all").strip().lower()
-if CONTROLLER_MODE not in {"bootstrap", "workspace", "all"}:
-    raise RuntimeError("CONTROLLER_MODE는 bootstrap, workspace, all 중 하나여야 합니다.")
+CONTROLLER_MODE = os.getenv("CONTROLLER_MODE", "").strip().lower()
+if CONTROLLER_MODE not in {"bootstrap", "workspace"}:
+    raise RuntimeError("CONTROLLER_MODE는 bootstrap 또는 workspace로 명시해야 합니다.")
 
 
 def validate_runtime_configuration():
-    if CONTROLLER_MODE in {"workspace", "all"}:
+    if CONTROLLER_MODE == "workspace":
         required = {
             "NFS_SERVER": NFS_SERVER,
             "NFS_PATH": NFS_PATH,
             "SNAPSHOT_NFS_SERVER": SNAPSHOT_NFS_SERVER,
             "SNAPSHOT_NFS_PATH": SNAPSHOT_NFS_PATH,
             "SERVICE_ACCOUNT": SERVICE_ACCOUNT,
-            "GENERATOR_SA_NAME": os.getenv("GENERATOR_SA_NAME", ""),
-            "GENERATOR_SA_NAMESPACE": os.getenv("GENERATOR_SA_NAMESPACE", ""),
             "WATCHER_NAMESPACE": os.getenv("WATCHER_NAMESPACE", ""),
             "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
             "WORKSPACE_PROXY_URL": WORKSPACE_PROXY_URL,
@@ -325,10 +365,11 @@ def validate_runtime_configuration():
         build_code_server_args(False)
         build_code_server_args(True)
         validate_nfs_mount()
-    if CONTROLLER_MODE in {"bootstrap", "all"}:
+    if CONTROLLER_MODE == "bootstrap":
         required = {
             "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
             "EXTERNAL_SECRET_STORE_NAME": EXTERNAL_SECRET_STORE_NAME,
+            "POD_NAMESPACE": CONTROLLER_NAMESPACE,
         }
         missing = [name for name, value in required.items() if not str(value).strip()]
         if missing:
@@ -355,7 +396,7 @@ def health_ready():
 def require_service_scope(required_scope: str, required_controller: str):
     """Validate a short-lived Backend service JWT and its operation scope."""
     def verify_service_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-        if CONTROLLER_MODE not in {required_controller, "all"}:
+        if CONTROLLER_MODE != required_controller:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="현재 Controller가 처리하지 않는 작업입니다.",
@@ -398,7 +439,7 @@ def require_service_scope(required_scope: str, required_controller: str):
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Generator 작업 권한이 없습니다: {required_scope}",
             )
-        if payload.get("namespace_prefix") != "jcode-":
+        if payload.get("namespace_prefix") != REQUEST_NAMESPACE_PREFIX:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Namespace 소유 범위가 유효하지 않습니다.")
         return payload
 
@@ -618,6 +659,8 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                 spec=client.V1PodSpec(
                     service_account_name=SERVICE_ACCOUNT,
                     automount_service_account_token=False,
+                    node_selector=get_workspace_node_selector(),
+                    tolerations=get_workspace_tolerations(),
                     security_context=client.V1PodSecurityContext(
                         seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")
                     ),
@@ -733,29 +776,71 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
     
 ################ Namespace 관리 함수 ##################
 
-ALLOWED_NS_PATTERN = re.compile(r"^jcode-[a-z0-9]+-\d+$")
+REQUEST_NAMESPACE_PREFIX = os.getenv("REQUEST_NAMESPACE_PREFIX", "jcode-").strip()
+COURSE_NAMESPACE_PREFIX = os.getenv("COURSE_NAMESPACE_PREFIX", REQUEST_NAMESPACE_PREFIX).strip()
+JCODE_ENVIRONMENT = os.getenv("JCODE_ENVIRONMENT", "prod").strip()
+if not re.fullmatch(r"[a-z0-9-]+-", REQUEST_NAMESPACE_PREFIX):
+    raise RuntimeError("REQUEST_NAMESPACE_PREFIX 형식이 올바르지 않습니다.")
+if not re.fullmatch(r"[a-z0-9-]+-", COURSE_NAMESPACE_PREFIX):
+    raise RuntimeError("COURSE_NAMESPACE_PREFIX 형식이 올바르지 않습니다.")
+if JCODE_ENVIRONMENT not in {"dev", "prod"}:
+    raise RuntimeError("JCODE_ENVIRONMENT은 dev 또는 prod여야 합니다.")
+REQUEST_NS_PATTERN = re.compile(rf"^{re.escape(REQUEST_NAMESPACE_PREFIX)}[a-z0-9]+-\d+$")
+COURSE_NS_PATTERN = re.compile(rf"^{re.escape(COURSE_NAMESPACE_PREFIX)}[a-z0-9]+-\d+$")
 PROTECTED_NAMESPACES = {"default", "kube-system", "kube-public", "kube-node-lease", "ingress-nginx", "monitoring", "watcher"}
 
 def validate_namespace(ns: str):
-    """jcode-{code}-{clss} 패턴만 허용하고, 시스템 NS 조작을 차단합니다."""
+    """현재 환경의 실제 course namespace만 허용합니다."""
     if ns in PROTECTED_NAMESPACES:
         raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'는 조작할 수 없습니다.")
-    if not ALLOWED_NS_PATTERN.match(ns):
-        raise HTTPException(status_code=400, detail=f"네임스페이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일치하지 않습니다: '{ns}'")
+    if not COURSE_NS_PATTERN.fullmatch(ns):
+        raise HTTPException(status_code=400, detail=f"현재 환경에서 허용되지 않은 Namespace입니다: '{ns}'")
+
+
+def resolve_namespace(ns: str) -> str:
+    """기존 Backend 요청 이름을 환경별 실제 namespace로 결정합니다."""
+    if COURSE_NS_PATTERN.fullmatch(ns):
+        return ns
+    if COURSE_NAMESPACE_PREFIX != REQUEST_NAMESPACE_PREFIX and REQUEST_NS_PATTERN.fullmatch(ns):
+        suffix = ns[len(REQUEST_NAMESPACE_PREFIX):]
+        resolved = f"{COURSE_NAMESPACE_PREFIX}{suffix}"
+        validate_namespace(resolved)
+        return resolved
+    validate_namespace(ns)
+    return ns
 
 def ensure_course_metadata(core_v1_api, namespace: str, course_id: int):
     name = "jcode-course-metadata"
-    expected = {"course-id": str(course_id), "namespace": namespace}
+    expected = {
+        "course-id": str(course_id),
+        "namespace": namespace,
+        "environment": JCODE_ENVIRONMENT,
+    }
     try:
         existing = core_v1_api.read_namespaced_config_map(name=name, namespace=namespace)
     except ApiException as e:
         if e.status != 404:
             raise
-        upsert_config_map(core_v1_api, namespace, name, expected)
+        core_v1_api.create_namespaced_config_map(
+            namespace=namespace,
+            body=client.V1ConfigMap(
+                metadata=client.V1ObjectMeta(
+                    name=name,
+                    namespace=namespace,
+                    labels={"app.kubernetes.io/managed-by": "jcode-bootstrap"},
+                ),
+                data=expected,
+                immutable=True,
+            ),
+        )
         return
 
     values = existing.data or {}
-    if values.get("course-id") != expected["course-id"] or values.get("namespace") != namespace:
+    if (
+        values.get("course-id") != expected["course-id"]
+        or values.get("namespace") != namespace
+        or (values.get("environment") is not None and values.get("environment") != JCODE_ENVIRONMENT)
+    ):
         raise HTTPException(
             status_code=409,
             detail="Namespace가 이미 다른 강의에 연결되어 있어 재초기화할 수 없습니다.",
@@ -773,12 +858,55 @@ def verify_course_namespace(core_v1_api, namespace: str, course_id: int):
             raise HTTPException(status_code=409, detail="Namespace가 bootstrap되지 않았습니다.")
         raise
     values = metadata.data or {}
-    if values.get("course-id") != str(course_id) or values.get("namespace") != namespace:
+    if (
+        values.get("course-id") != str(course_id)
+        or values.get("namespace") != namespace
+        or (values.get("environment") is not None and values.get("environment") != JCODE_ENVIRONMENT)
+    ):
         raise HTTPException(status_code=403, detail="courseId와 Namespace 소유 관계가 일치하지 않습니다.")
+    namespace_object = core_v1_api.read_namespace(name=namespace)
+    labels = namespace_object.metadata.labels or {}
+    annotations = namespace_object.metadata.annotations or {}
+    if labels.get("jcode.io/environment") != JCODE_ENVIRONMENT or annotations.get("jcode.io/environment") != JCODE_ENVIRONMENT:
+        raise HTTPException(status_code=403, detail="Namespace 환경 정보가 현재 Controller와 일치하지 않습니다.")
 
 
-GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-workspace")
-GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
+def ensure_namespace_metadata(core_v1_api, namespace: str, course_id: int):
+    """기존 namespace의 강의 소유권을 확인하고 Admission용 metadata를 보완한다."""
+    existing = core_v1_api.read_namespace(name=namespace)
+    annotations = existing.metadata.annotations or {}
+    labels = existing.metadata.labels or {}
+    recorded_course_id = annotations.get("jcode.io/course-id")
+    recorded_environment = annotations.get("jcode.io/environment") or labels.get("jcode.io/environment")
+    if recorded_course_id and recorded_course_id != str(course_id):
+        raise HTTPException(status_code=409, detail="Namespace가 이미 다른 강의에 연결되어 있습니다.")
+    if recorded_environment and recorded_environment != JCODE_ENVIRONMENT:
+        raise HTTPException(status_code=409, detail="Namespace가 다른 환경에 연결되어 있습니다.")
+    if not recorded_course_id:
+        # 구버전 namespace는 ConfigMap 소유권을 먼저 확인한 뒤 metadata를 승격한다.
+        verify_course_namespace(core_v1_api, namespace, course_id)
+    core_v1_api.patch_namespace(
+        name=namespace,
+        body={
+            "metadata": {
+                "labels": {
+                    "role": NS_ROLE_LABEL,
+                    "app.kubernetes.io/managed-by": "jcode-bootstrap",
+                    "jcode.io/course-id": str(course_id),
+                    "jcode.io/environment": JCODE_ENVIRONMENT,
+                },
+                "annotations": {
+                    "jcode.io/course-id": str(course_id),
+                    "jcode.io/environment": JCODE_ENVIRONMENT,
+                },
+            }
+        },
+    )
+
+
+WORKSPACE_CONTROLLER_SA = os.getenv("WORKSPACE_CONTROLLER_SA", "jcode-workspace-v2").strip()
+WORKSPACE_RUNTIME_CLUSTER_ROLE = os.getenv("WORKSPACE_RUNTIME_CLUSTER_ROLE", "jcode-workspace-runtime-v2").strip()
+CONTROLLER_NAMESPACE = os.getenv("POD_NAMESPACE", "watcher").strip()
 NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
 WATCHER_NAMESPACE = os.getenv("WATCHER_NAMESPACE", "watcher")
 CONFIG_VERSION = os.getenv("JCODE_CONFIG_VERSION", "2026-08-09")
@@ -914,14 +1042,45 @@ def wait_for_external_image_pull_secrets(custom_objects_api, namespace: str):
         if pending:
             time.sleep(1)
 
+
+def build_workspace_role_binding(namespace: str) -> client.V1RoleBinding:
+    return client.V1RoleBinding(
+        metadata=client.V1ObjectMeta(
+            name="jcode-workspace-runtime-v2",
+            namespace=namespace,
+            labels={"app.kubernetes.io/managed-by": "jcode-bootstrap"},
+        ),
+        subjects=[
+            client.RbacV1Subject(
+                kind="ServiceAccount",
+                name=WORKSPACE_CONTROLLER_SA,
+                namespace=CONTROLLER_NAMESPACE,
+            )
+        ],
+        role_ref=client.V1RoleRef(
+            kind="ClusterRole",
+            name=WORKSPACE_RUNTIME_CLUSTER_ROLE,
+            api_group="rbac.authorization.k8s.io",
+        ),
+    )
+
 def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api, namespace: str, course_id: int, use_vnc: bool = False):
-    """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
+    """고정된 namespace metadata와 runtime 권한으로 강의 공간을 초기화합니다."""
 
     # 1. Namespace
     ns_body = client.V1Namespace(
         metadata=client.V1ObjectMeta(
             name=namespace,
-            labels={"role": NS_ROLE_LABEL}
+            labels={
+                "role": NS_ROLE_LABEL,
+                "app.kubernetes.io/managed-by": "jcode-bootstrap",
+                "jcode.io/course-id": str(course_id),
+                "jcode.io/environment": JCODE_ENVIRONMENT,
+            },
+            annotations={
+                "jcode.io/course-id": str(course_id),
+                "jcode.io/environment": JCODE_ENVIRONMENT,
+            },
         )
     )
     try:
@@ -930,6 +1089,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, cus
     except ApiException as e:
         if e.status == 409:
             logger.info(f"Namespace '{namespace}'가 이미 존재합니다.")
+            ensure_namespace_metadata(core_v1_api, namespace, course_id)
         else:
             raise
 
@@ -957,78 +1117,23 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, cus
         else:
             raise
 
-    # 3. Role
-    role_body = client.V1Role(
-        metadata=client.V1ObjectMeta(
-            name="deployment-manager",
-            namespace=namespace
-        ),
-        rules=[
-            client.V1PolicyRule(
-                api_groups=["apps"],
-                resources=["deployments"],
-                verbs=["create", "get", "list", "watch", "update", "patch", "delete"]
-            ),
-            client.V1PolicyRule(
-                api_groups=[""],
-                resources=["services"],
-                verbs=["create", "get", "list", "watch", "update", "patch", "delete"]
-            ),
-            client.V1PolicyRule(
-                api_groups=[""],
-                resources=["configmaps"],
-                verbs=["create", "get", "list", "watch", "update", "patch"]
-            ),
-        ]
-    )
-    try:
-        rbac_v1_api.create_namespaced_role(namespace=namespace, body=role_body)
-        logger.info(f"Role 'deployment-manager' 생성 완료")
-    except ApiException as e:
-        if e.status == 409:
-            rbac_v1_api.patch_namespaced_role(
-                name="deployment-manager",
-                namespace=namespace,
-                body=role_body,
-            )
-            logger.info(f"Role 'deployment-manager' 갱신 완료")
-        else:
-            raise
-
-    # 4. RoleBinding
-    rb_body = client.V1RoleBinding(
-        metadata=client.V1ObjectMeta(
-            name="deployment-manager-binding",
-            namespace=namespace
-        ),
-        subjects=[
-            client.RbacV1Subject(
-                kind="ServiceAccount",
-                name=GENERATOR_SA_NAME,
-                namespace=GENERATOR_SA_NAMESPACE
-            )
-        ],
-        role_ref=client.V1RoleRef(
-            kind="Role",
-            name="deployment-manager",
-            api_group="rbac.authorization.k8s.io"
-        )
-    )
+    # 3. RoleBinding. 권한 규칙과 대상은 요청값으로 받지 않고 고정한다.
+    rb_body = build_workspace_role_binding(namespace)
     try:
         rbac_v1_api.create_namespaced_role_binding(namespace=namespace, body=rb_body)
-        logger.info(f"RoleBinding 'deployment-manager-binding' 생성 완료")
+        logger.info("RoleBinding 'jcode-workspace-runtime-v2' 생성 완료")
     except ApiException as e:
         if e.status == 409:
             rbac_v1_api.patch_namespaced_role_binding(
-                name="deployment-manager-binding",
+                name="jcode-workspace-runtime-v2",
                 namespace=namespace,
                 body=rb_body,
             )
-            logger.info(f"RoleBinding 'deployment-manager-binding' 갱신 완료")
+            logger.info("RoleBinding 'jcode-workspace-runtime-v2' 갱신 완료")
         else:
             raise
 
-    # 5. ConfigMap (code-server-config)
+    # 4. ConfigMap (code-server-config)
     ensure_code_server_config(core_v1_api, namespace)
     ensure_course_metadata(core_v1_api, namespace, course_id)
     if use_vnc:
@@ -1216,7 +1321,7 @@ async def create_namespace_api(
     token_payload: dict = Depends(require_service_scope("namespace:write", "bootstrap")),
 ):
     """NS 초기화: Namespace + SA + Role + RoleBinding + ConfigMap + LimitRange + NetworkPolicy"""
-    validate_namespace(request.namespace)
+    namespace = resolve_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
@@ -1231,11 +1336,11 @@ async def create_namespace_api(
             rbac_v1_api,
             networking_v1_api,
             custom_objects_api,
-            request.namespace,
+            namespace,
             request.course_id,
             request.use_vnc,
         )
-        return {"msg": f"Namespace '{request.namespace}' 초기화 완료"}
+        return {"msg": f"Namespace '{namespace}' 초기화 완료", "namespace": namespace}
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1267,29 +1372,29 @@ async def delete_namespace_api(
     token_payload: dict = Depends(require_service_scope("namespace:delete", "bootstrap")),
 ):
     """NS 삭제: 네임스페이스와 내부 모든 리소스를 삭제합니다."""
-    validate_namespace(ns)
+    namespace = resolve_namespace(ns)
 
     core_v1_api = client.CoreV1Api()
 
     try:
-        core_v1_api.read_namespace(name=ns)
+        core_v1_api.read_namespace(name=namespace)
     except ApiException as e:
         if e.status == 404:
-            return {"msg": f"Namespace '{ns}'는 이미 삭제되었습니다.", "deleted": True}
+            return {"msg": f"Namespace '{namespace}'는 이미 삭제되었습니다.", "deleted": True}
         raise
 
-    verify_course_namespace(core_v1_api, ns, course_id)
+    verify_course_namespace(core_v1_api, namespace, course_id)
 
     try:
-        core_v1_api.delete_namespace(name=ns)
-        logger.info("Namespace '%s' 삭제 요청 완료", ns)
-        if not wait_for_namespace_deleted(core_v1_api, ns):
+        core_v1_api.delete_namespace(name=namespace)
+        logger.info("Namespace '%s' 삭제 요청 완료", namespace)
+        if not wait_for_namespace_deleted(core_v1_api, namespace):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Namespace '{ns}'가 아직 Terminating 상태입니다. 잠시 후 다시 시도해 주세요.",
+                detail=f"Namespace '{namespace}'가 아직 Terminating 상태입니다. 잠시 후 다시 시도해 주세요.",
             )
-        logger.info("Namespace '%s' 실제 삭제 확인 완료", ns)
-        return {"msg": f"Namespace '{ns}' 삭제 확인 완료", "deleted": True}
+        logger.info("Namespace '%s' 실제 삭제 확인 완료", namespace)
+        return {"msg": f"Namespace '{namespace}' 삭제 확인 완료", "deleted": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -1304,23 +1409,23 @@ async def delete_namespace_resources_api(
     token_payload: dict = Depends(require_service_scope("namespace:resources:delete", "workspace")),
 ):
     """NS 내 Deployment/Service 삭제 (Pod는 owner cascade, NS 자체는 유지)."""
-    validate_namespace(ns)
+    namespace = resolve_namespace(ns)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
     try:
-        core_v1_api.read_namespace(name=ns)
+        core_v1_api.read_namespace(name=namespace)
     except ApiException as e:
         if e.status == 404:
-            return {"msg": f"Namespace '{ns}'의 리소스는 이미 없습니다."}
+            return {"msg": f"Namespace '{namespace}'의 리소스는 이미 없습니다."}
         raise
 
-    verify_course_namespace(core_v1_api, ns, course_id)
+    verify_course_namespace(core_v1_api, namespace, course_id)
 
     try:
-        delete_all_resources_in_namespace(core_v1_api, apps_v1_api, ns)
-        return {"msg": f"Namespace '{ns}'의 모든 리소스 삭제 완료"}
+        delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace)
+        return {"msg": f"Namespace '{namespace}'의 모든 리소스 삭제 완료"}
     except Exception as e:
         logger.exception("리소스 삭제 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1331,7 +1436,7 @@ async def deploy_resources(
     request: DeployRequest,
     token_payload: dict = Depends(require_service_scope("jcode:write", "workspace")),
 ):
-    validate_namespace(request.namespace)
+    namespace = resolve_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
@@ -1339,10 +1444,10 @@ async def deploy_resources(
     # Workspace Controller는 이미 bootstrap된 Namespace의 소유 메타데이터와
     # 런타임 ConfigMap만 확인한다. Cluster-scoped 리소스는 만지지 않는다.
     try:
-        verify_course_namespace(core_v1_api, request.namespace, request.course_id)
-        ensure_code_server_config(core_v1_api, request.namespace)
+        verify_course_namespace(core_v1_api, namespace, request.course_id)
+        ensure_code_server_config(core_v1_api, namespace)
         if request.use_vnc:
-            ensure_watcher_hook_config(core_v1_api, request.namespace)
+            ensure_watcher_hook_config(core_v1_api, namespace)
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
@@ -1352,7 +1457,7 @@ async def deploy_resources(
     try:
         deployment_msg = create_deployment(
             apps_v1_api,
-            request.namespace,
+            namespace,
             request.deployment_name,
             request.app_label,
             request.file_path,
@@ -1365,13 +1470,13 @@ async def deploy_resources(
         )
         service_msg = create_service(
             core_v1_api,
-            request.namespace,
+            namespace,
             request.service_name,
             request.app_label,
             request.use_vnc
         )
 
-        jcodeUrl = f"http://{request.service_name}.{request.namespace}.svc.cluster.local:8080"
+        jcodeUrl = f"http://{request.service_name}.{namespace}.svc.cluster.local:8080"
         msg = f"{deployment_msg}; {service_msg}"
 
         return {"jcodeUrl": jcodeUrl, "msg": msg}
@@ -1384,30 +1489,30 @@ async def delete_resources(
     request: DeleteRequest,
     token_payload: dict = Depends(require_service_scope("jcode:delete", "workspace")),
 ):
-    validate_namespace(request.namespace)
+    namespace = resolve_namespace(request.namespace)
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
-    verify_course_namespace(core_v1_api, request.namespace, request.course_id)
+    verify_course_namespace(core_v1_api, namespace, request.course_id)
 
     # 네임스페이스 존재 여부 확인
     try:
-        core_v1_api.read_namespace(name=request.namespace)
+        core_v1_api.read_namespace(name=namespace)
     except ApiException as e:
         if e.status == 404:
-            return {"msg": f"Namespace '{request.namespace}'와 JCode 리소스는 이미 없습니다."}
+            return {"msg": f"Namespace '{namespace}'와 JCode 리소스는 이미 없습니다."}
         raise
 
     try:
         # 삭제 시에는 file_path, app_label 등은 사용하지 않고 이름만 사용
         deployment_msg = delete_deployment(
             apps_v1_api,
-            request.namespace,
+            namespace,
             request.deployment_name
         )
         service_msg = delete_service(
             core_v1_api,
-            request.namespace,
+            namespace,
             request.service_name
         )
 
@@ -1423,11 +1528,11 @@ async def provision_workspace(
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     """과제 생성 시 호출: 해당 과목의 모든 학생 NFS 워크스페이스에 디렉토리 생성"""
-    validate_namespace(request.namespace)
-    verify_course_namespace(client.CoreV1Api(), request.namespace, request.course_id)
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
     dir_name = validate_workspace_dir_name(request.dir_name)
 
-    class_div = request.namespace.replace("jcode-", "", 1)
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
 
     base_path = str(get_nfs_workspace_path())
     try:
@@ -1460,7 +1565,7 @@ async def deploy_starter_code(
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     """스타터 코드 zip 파일을 모든 학생 워크스페이스에 배포"""
-    validate_namespace(namespace)
+    namespace = resolve_namespace(namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, course_id)
     dir_name = validate_workspace_dir_name(dir_name)
 
@@ -1469,7 +1574,7 @@ async def deploy_starter_code(
     import tempfile
     import shutil
 
-    class_div = namespace.replace("jcode-", "", 1)
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     base_path = str(get_nfs_workspace_path())
     try:
         validate_nfs_mount()

@@ -24,7 +24,10 @@ trap 'rm -f "$config_file"' EXIT
 {
   echo "http_port ${port}"
   echo "acl workspace_network src ${allowed_cidr}"
+  echo "acl cache_manager urlpath_regex -i ^/squid-internal-mgr/"
   echo "acl blocked_destination dst 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 ::1/128 fc00::/7 fe80::/10"
+  echo "http_access allow cache_manager workspace_network"
+  echo "http_access deny cache_manager"
   echo "http_access deny blocked_destination"
   echo "http_access allow workspace_network"
   echo "http_access deny all"

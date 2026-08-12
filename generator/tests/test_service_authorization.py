@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 @pytest.fixture()
 def generator(monkeypatch):
     monkeypatch.setenv("GENERATOR_SERVICE_SECRET", "0123456789abcdef0123456789abcdef")
-    monkeypatch.setenv("CONTROLLER_MODE", "all")
+    monkeypatch.setenv("CONTROLLER_MODE", "bootstrap")
     monkeypatch.setattr(config, "load_incluster_config", lambda: None)
     module = importlib.import_module("main")
     return importlib.reload(module)
@@ -43,8 +43,29 @@ def credentials(value):
     return HTTPAuthorizationCredentials(scheme="Bearer", credentials=value)
 
 
+@pytest.mark.parametrize("namespace", ["default", "watcher", "jcode-OS-1", "course-os-1", "jcode-os"])
+def test_namespace_name_rejects_outside_or_invalid_values(generator, namespace):
+    with pytest.raises(HTTPException):
+        generator.validate_namespace(namespace)
+
+
+def test_namespace_name_accepts_course_pattern(generator):
+    generator.validate_namespace("jcode-os-1")
+
+
+def test_dev_namespace_is_resolved_without_backend_contract_change(generator, monkeypatch):
+    monkeypatch.setenv("JCODE_ENVIRONMENT", "dev")
+    monkeypatch.setenv("COURSE_NAMESPACE_PREFIX", "jcode-dev-")
+    dev_generator = importlib.reload(generator)
+
+    assert dev_generator.resolve_namespace("jcode-os-1") == "jcode-dev-os-1"
+    dev_generator.validate_namespace("jcode-dev-os-1")
+    with pytest.raises(HTTPException):
+        dev_generator.validate_namespace("jcode-os-1")
+
+
 def test_service_token_requires_correct_audience(generator):
-    dependency = generator.require_service_scope("jcode:write", "workspace")
+    dependency = generator.require_service_scope("jcode:write", "bootstrap")
     with pytest.raises(HTTPException) as error:
         dependency(credentials(token(generator, audience="browser")))
     assert error.value.status_code == 401
@@ -62,6 +83,14 @@ def test_course_namespace_metadata_must_match(generator):
         def read_namespaced_config_map(self, name, namespace):
             return generator.client.V1ConfigMap(data={"course-id": "11", "namespace": namespace})
 
+        def read_namespace(self, name):
+            return generator.client.V1Namespace(
+                metadata=generator.client.V1ObjectMeta(
+                    labels={"jcode.io/environment": "prod"},
+                    annotations={"jcode.io/environment": "prod"},
+                )
+            )
+
     generator.verify_course_namespace(CoreV1(), "jcode-os-1", 11)
     with pytest.raises(HTTPException) as error:
         generator.verify_course_namespace(CoreV1(), "jcode-os-1", 12)
@@ -75,6 +104,55 @@ def test_course_namespace_metadata_cannot_be_reassigned(generator):
 
     with pytest.raises(HTTPException) as error:
         generator.ensure_course_metadata(CoreV1(), "jcode-os-1", 12)
+    assert error.value.status_code == 409
+
+
+def test_course_namespace_metadata_is_created_immutable(generator):
+    class CoreV1:
+        created = None
+
+        def read_namespaced_config_map(self, name, namespace):
+            raise generator.ApiException(status=404)
+
+        def create_namespaced_config_map(self, namespace, body):
+            self.created = body
+
+    core = CoreV1()
+    generator.ensure_course_metadata(core, "jcode-os-1", 11)
+
+    assert core.created.immutable is True
+    assert core.created.data == {
+        "course-id": "11",
+        "namespace": "jcode-os-1",
+        "environment": "prod",
+    }
+
+
+def test_workspace_role_binding_is_fixed_to_runtime_cluster_role(generator):
+    binding = generator.build_workspace_role_binding("jcode-os-1")
+
+    assert binding.metadata.namespace == "jcode-os-1"
+    assert binding.role_ref.kind == "ClusterRole"
+    assert binding.metadata.name == "jcode-workspace-runtime-v2"
+    assert binding.role_ref.name == "jcode-workspace-runtime-v2"
+    assert [(item.kind, item.namespace, item.name) for item in binding.subjects] == [
+        ("ServiceAccount", "watcher", "jcode-workspace-v2")
+    ]
+
+
+def test_existing_namespace_metadata_cannot_change_course(generator):
+    class CoreV1:
+        def read_namespace(self, name):
+            return generator.client.V1Namespace(
+                metadata=generator.client.V1ObjectMeta(
+                    name=name,
+                    annotations={"jcode.io/course-id": "11"},
+                )
+            )
+
+    with pytest.raises(HTTPException) as error:
+        generator.ensure_namespace_metadata(CoreV1(), "jcode-os-1", 12)
+
     assert error.value.status_code == 409
 
 

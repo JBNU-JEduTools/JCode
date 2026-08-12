@@ -43,11 +43,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: harbor.jbnu.ac.kr
-          username: ${{ secrets.HARBOR_USERNAME }}
-          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Login to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if printf '%s' "$HARBOR_PASSWORD" | timeout 30 docker login harbor.jbnu.ac.kr --username "$HARBOR_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          exit 1
       - name: Verify immutable artifacts
         env:
           GENERATOR_DIGEST: ${{ inputs.generator_digest }}

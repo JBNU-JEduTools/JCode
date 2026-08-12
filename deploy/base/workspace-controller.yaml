@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: jcode-workspace
+  name: jcode-workspace-v2
   namespace: watcher
 automountServiceAccountToken: true
 ---
@@ -21,7 +21,24 @@ spec:
       labels:
         app: jcode-generator
     spec:
-      serviceAccountName: jcode-workspace
+      serviceAccountName: jcode-workspace-v2
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: jcode-generator
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: jcode-generator
+            topologyKey: kubernetes.io/hostname
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       imagePullSecrets:
       - name: watcher-harbor-registry-secret
       containers:
@@ -38,6 +55,12 @@ spec:
         env:
         - name: CONTROLLER_MODE
           value: "workspace"
+        - name: JCODE_ENVIRONMENT
+          value: "prod"
+        - name: REQUEST_NAMESPACE_PREFIX
+          value: "jcode-"
+        - name: COURSE_NAMESPACE_PREFIX
+          value: "jcode-"
         - name: NFS_MOUNT_PATH
           value: "/nfs-data"
         volumeMounts:
@@ -61,6 +84,11 @@ spec:
             memory: 1.5Gi
           limits:
             memory: 2Gi
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
       volumes:
       - name: workspace-storage
         persistentVolumeClaim:

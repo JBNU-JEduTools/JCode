@@ -23,8 +23,6 @@ data:
   CODE_SERVER_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
   CODE_SERVER_VNC_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
   WORKSPACE_ROOT: "/home/coder/project"
-  GENERATOR_SA_NAME: "jcode-workspace"
-  GENERATOR_SA_NAMESPACE: "watcher"
   WATCHER_NAMESPACE: "watcher"
   WORKSPACE_PROXY_URL: "http://jcode-router-svc.watcher.svc.cluster.local:3000"
   WORKSPACE_PROXY_NAMESPACE: "watcher"

@@ -47,12 +47,16 @@ RUN mkdir -p /runtime && \
 
 # === Final Stage ===
 FROM ${JCODE_CODE_SERVER_BASE}
+ARG JCODE_CODE_SERVER_BASE_DIGEST
+ARG JCODE_CODE_SERVER_REVISION
 
 LABEL org.opencontainers.image.title="code-server-vnc"
 LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc 환경 이미지"
 LABEL org.opencontainers.image.authors="OSLAB"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
+LABEL org.opencontainers.image.revision="${JCODE_CODE_SERVER_REVISION}"
+LABEL org.opencontainers.image.base.digest="${JCODE_CODE_SERVER_BASE_DIGEST}"
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive

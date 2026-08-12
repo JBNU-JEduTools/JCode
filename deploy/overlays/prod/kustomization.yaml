@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: watcher
+resources:
+  - ../../base
+  - controller-bindings.yaml
+  - generator-availability.yaml
+  - router-availability.yaml
+replicas:
+  - name: jcode-bootstrap
+    count: 1
+  - name: jcode-generator
+    count: 2
+  - name: jcode-router
+    count: 2
+  - name: squid-exporter
+    count: 1

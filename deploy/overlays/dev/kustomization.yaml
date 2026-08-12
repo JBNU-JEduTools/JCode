@@ -1,0 +1,123 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dev
+resources:
+  - ../../base
+  - controller-bindings.yaml
+replicas:
+  - name: jcode-bootstrap
+    count: 1
+  - name: jcode-generator
+    count: 1
+  - name: jcode-router
+    count: 1
+  - name: squid-exporter
+    count: 1
+patches:
+  - target:
+      kind: Deployment
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ignored
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              env: dev
+            tolerations:
+              - key: dev-node
+                operator: Equal
+                value: "true"
+                effect: NoSchedule
+  - target:
+      kind: ServiceMonitor
+    patch: |-
+      - op: replace
+        path: /spec/namespaceSelector/matchNames/0
+        value: dev
+  - target:
+      kind: Deployment
+      name: jcode-generator
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: jcode-generator
+      spec:
+        template:
+          spec:
+            containers:
+              - name: jcode-generator
+                env:
+                  - name: JCODE_ENVIRONMENT
+                    value: dev
+                  - name: COURSE_NAMESPACE_PREFIX
+                    value: jcode-dev-
+                  - name: WORKSPACE_NODE_SELECTOR
+                    value: '{"env":"dev"}'
+                  - name: WORKSPACE_TOLERATIONS
+                    value: '[{"key":"dev-node","operator":"Equal","value":"true","effect":"NoSchedule"}]'
+                envFrom:
+                  - configMapRef:
+                      name: jcode-generator-dev-configmap
+                  - secretRef:
+                      name: jcode-generator-dev-secret
+  - target:
+      kind: Deployment
+      name: jcode-bootstrap
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: jcode-bootstrap
+      spec:
+        template:
+          spec:
+            containers:
+              - name: bootstrap
+                env:
+                  - name: JCODE_ENVIRONMENT
+                    value: dev
+                  - name: COURSE_NAMESPACE_PREFIX
+                    value: jcode-dev-
+                envFrom:
+                  - configMapRef:
+                      name: jcode-generator-dev-configmap
+                  - secretRef:
+                      name: jcode-generator-dev-secret
+  - target:
+      kind: Deployment
+      name: jcode-router
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: jcode-router
+      spec:
+        template:
+          spec:
+            containers:
+              - name: jcode-router
+                envFrom:
+                  - configMapRef:
+                      name: jcode-router-dev-config
+                  - secretRef:
+                      name: jcode-router-dev-secret
+  - target:
+      kind: Deployment
+      name: squid-exporter
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: squid-exporter
+      spec:
+        template:
+          spec:
+            containers:
+              - name: squid-exporter
+                env:
+                  - name: SQUID_HOSTNAME
+                    value: jcode-router-svc.dev.svc.cluster.local

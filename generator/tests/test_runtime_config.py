@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 @pytest.fixture()
 def generator(monkeypatch):
     monkeypatch.setenv("GENERATOR_SERVICE_SECRET", "0123456789abcdef0123456789abcdef")
-    monkeypatch.setenv("CONTROLLER_MODE", "all")
+    monkeypatch.setenv("CONTROLLER_MODE", "workspace")
     monkeypatch.setenv("WORKSPACE_ROOT", "/home/coder/project")
     monkeypatch.setattr(config, "load_incluster_config", lambda: None)
     module = importlib.import_module("main")
@@ -122,6 +122,26 @@ def test_workspace_proxy_environment_contains_upper_and_lowercase(generator, mon
     assert values["HTTP_PROXY"] == "http://proxy.watcher.svc:3000"
     assert values["https_proxy"] == "http://proxy.watcher.svc:3000"
     assert ".svc" in values["NO_PROXY"]
+
+
+def test_workspace_scheduling_config_is_parsed(generator, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_NODE_SELECTOR", '{"env":"dev"}')
+    monkeypatch.setenv(
+        "WORKSPACE_TOLERATIONS",
+        '[{"key":"dev-node","operator":"Equal","value":"true","effect":"NoSchedule"}]',
+    )
+
+    assert generator.get_workspace_node_selector() == {"env": "dev"}
+    toleration = generator.get_workspace_tolerations()[0]
+    assert toleration.key == "dev-node"
+    assert toleration.effect == "NoSchedule"
+
+
+def test_workspace_scheduling_config_rejects_invalid_json(generator, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_NODE_SELECTOR", "[]")
+
+    with pytest.raises(RuntimeError, match="key/value"):
+        generator.get_workspace_node_selector()
 
 
 def test_watcher_hook_config_is_created_and_contains_dynamic_assignment_lookup(generator):

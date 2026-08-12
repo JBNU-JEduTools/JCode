@@ -34,7 +34,7 @@ JCODE_NAMESPACE="$namespace" generator/k8s/configure-workspace-storage.sh
 
 render_dir=$(mktemp -d)
 trap 'rm -rf "$render_dir"' EXIT
-python - "$namespace" "$generator_digest" "$router_digest" "$squid_exporter_digest" "$render_dir" <<'PY'
+python3 - "$namespace" "$generator_digest" "$router_digest" "$squid_exporter_digest" "$render_dir" <<'PY'
 import sys
 from pathlib import Path
 

@@ -25,6 +25,7 @@ WORKDIR /app
 
 # 소스 코드 복사
 COPY . .
+RUN chmod -R a+rX /app
 
 # 컨테이너 포트 노출
 EXPOSE 5000
