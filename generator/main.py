@@ -152,6 +152,12 @@ class ProvisionRequest(BaseModel):
     namespace: str
     dir_name: str
 
+class SmokeWorkspaceRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    namespace: str
+    file_path: str
+    student_num: str
+
 
 def parse_csv_env(name: str) -> list[str]:
     value = os.getenv(name, "")
@@ -233,7 +239,17 @@ def get_code_server_args(use_vnc: bool) -> Optional[list[str]]:
 
 def get_code_server_extra_env(use_vnc: bool) -> list[client.V1EnvVar]:
     workspace_root = get_workspace_root()
-    env = [client.V1EnvVar(name="WORKSPACE_ROOT", value=workspace_root)]
+    watcher_namespace = "dev" if os.getenv("JCODE_ENVIRONMENT", "prod").strip() == "dev" else "watcher"
+    watcher_api_base = os.getenv(
+        "WATCHER_API_BASE",
+        f"http://watcher-backend-service.{watcher_namespace}.svc.cluster.local:3000",
+    ).strip().rstrip("/")
+    if not watcher_api_base:
+        raise RuntimeError("WATCHER_API_BASE를 설정해야 합니다.")
+    env = [
+        client.V1EnvVar(name="WORKSPACE_ROOT", value=workspace_root),
+        client.V1EnvVar(name="WATCHER_API_BASE", value=watcher_api_base),
+    ]
     if use_vnc:
         env.append(
             client.V1EnvVar(
@@ -287,6 +303,57 @@ def get_nfs_workspace_path() -> Path:
     if not mount_path.is_absolute():
         raise RuntimeError("NFS_MOUNT_PATH는 절대 경로여야 합니다.")
     return mount_path / "workspace"
+
+
+def get_smoke_workspace_paths(file_path: str, student_num: str) -> tuple[Path, Path]:
+    if not re.fullmatch(r"workspace/release-smoke/jcode-release-[0-9]+-smoke", file_path):
+        raise HTTPException(status_code=400, detail="smoke workspace 경로 형식이 올바르지 않습니다.")
+    if not re.fullmatch(r"release-smoke-[0-9]+", student_num):
+        raise HTTPException(status_code=400, detail="smoke extension 경로 형식이 올바르지 않습니다.")
+
+    nfs_root = Path(NFS_MOUNT_PATH).resolve()
+    candidates = (
+        nfs_root.joinpath(*file_path.split("/")),
+        nfs_root / "extensions" / student_num,
+    )
+    paths = []
+    for candidate in candidates:
+        current = candidate
+        while current != nfs_root:
+            if current.exists() and current.is_symlink():
+                raise HTTPException(status_code=400, detail="smoke 경로에 symlink를 사용할 수 없습니다.")
+            current = current.parent
+        path = candidate.resolve()
+        try:
+            path.relative_to(nfs_root)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="smoke 경로가 NFS 범위를 벗어납니다.") from error
+        paths.append(path)
+    return paths[0], paths[1]
+
+
+def prepare_smoke_workspace(file_path: str, student_num: str) -> tuple[Path, Path]:
+    validate_nfs_mount()
+    paths = get_smoke_workspace_paths(file_path, student_num)
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+        os.chown(path, 1000, 1000)
+    return paths
+
+
+def cleanup_smoke_workspace(file_path: str, student_num: str) -> None:
+    import shutil
+
+    paths = get_smoke_workspace_paths(file_path, student_num)
+    for path in paths:
+        if path.exists():
+            shutil.rmtree(path)
+    # workspace/release-smoke는 이 기능 전용이므로 비어 있으면 정리한다.
+    # extensions는 공용 루트이므로 절대 삭제하지 않는다.
+    try:
+        paths[0].parent.rmdir()
+    except OSError:
+        pass
 
 
 def validate_nfs_mount() -> None:
@@ -1341,6 +1408,8 @@ async def create_namespace_api(
             request.use_vnc,
         )
         return {"msg": f"Namespace '{namespace}' 초기화 완료", "namespace": namespace}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1554,6 +1623,38 @@ async def provision_workspace(
 
     logger.info(f"Provisioned '{dir_name}' in {created} student directories for {class_div}")
     return {"created": created, "dir_name": dir_name}
+
+
+@app.post("/api/workspace/smoke")
+async def prepare_workspace_smoke(
+    request: SmokeWorkspaceRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:smoke", "workspace")),
+):
+    """릴리스 검증용 NFS 경로를 제한된 이름으로 준비합니다."""
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    try:
+        workspace_path, extension_path = prepare_smoke_workspace(request.file_path, request.student_num)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    nfs_root = Path(NFS_MOUNT_PATH).resolve()
+    return {
+        "prepared": True,
+        "workspace": str(workspace_path.relative_to(nfs_root)),
+        "extensions": str(extension_path.relative_to(nfs_root)),
+    }
+
+
+@app.delete("/api/workspace/smoke")
+async def delete_workspace_smoke(
+    request: SmokeWorkspaceRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:smoke", "workspace")),
+):
+    """릴리스 검증이 만든 NFS 경로만 삭제합니다."""
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    cleanup_smoke_workspace(request.file_path, request.student_num)
+    return {"deleted": True}
 
 
 @app.post("/api/workspace/starter-code")

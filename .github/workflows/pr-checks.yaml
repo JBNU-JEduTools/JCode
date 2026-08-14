@@ -17,30 +17,220 @@ jobs:
           python-version: "3.10"
           cache: pip
           cache-dependency-path: generator/requirements.txt
+      - uses: azure/setup-kubectl@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: image/squid-exporter/go.mod
+          cache-dependency-path: image/squid-exporter/go.mod
       - run: python -m pip install -r generator/requirements.txt pytest
       - run: python -m pytest -q generator/tests
+      - run: go test ./...
+        working-directory: image/squid-exporter
+      - run: docker build -t jcode-squid-exporter:pr image/squid-exporter
       - name: Validate manifests and shell
         run: |
           python - <<'PY'
           from pathlib import Path
           import yaml
 
-          for path in Path("generator/k8s").glob("*.yaml"):
+          for path in list(Path("generator/k8s").glob("*.yaml")) + list(Path("deploy").rglob("*.yaml")):
               list(yaml.safe_load_all(path.read_text()))
           PY
-          bash -n generator/k8s/jcode-init.sh
           bash -n generator/k8s/bootstrap-prerequisites.sh
           bash -n generator/k8s/configure-workspace-storage.sh
           bash -n router/k8s/configure-squid.sh
+          bash -n deploy/migrate-course-metadata.sh
+          bash -n deploy/generator-token.sh
+          bash -n deploy/legacy-plan.sh
+          bash -n deploy/test-legacy-plan.sh
+          deploy/test-legacy-plan.sh
+          bash -n deploy/test-course-metadata-policy.sh
+          bash -n deploy/migrate-workspace-rbac.sh
+          bash -n deploy/finalize-workspace-rbac.sh
+          bash -n deploy/smoke-workspace-lifecycle.sh
+          bash -n deploy/verify-release-images.sh
+          bash -n deploy/install-cluster-v2.sh
+          bash -n deploy/cutover-dev.sh
           bash -n deploy/deploy.sh
+          jq -e '
+            .schema == 1 and
+            .environments.dev["jcode-dev-1"].action == "quarantine" and
+            .environments.dev["jcode-realtest2-1"] == {action:"migrate",course_id:6,target_namespace:"jcode-dev-realtest2-1",use_vnc:false,session_policy:"recreate"} and
+            .environments.dev["jcode-test2502-1"] == {action:"migrate",course_id:1,target_namespace:"jcode-dev-test2502-1",use_vnc:false,session_policy:"recreate"} and
+            .environments.prod["jcode-jct-1"].action == "quarantine"
+          ' deploy/legacy-namespace-plan.json >/dev/null
+          kubectl kustomize deploy/cluster > /tmp/jcode-cluster.yaml
+          kubectl kustomize deploy/overlays/dev > /tmp/jcode-dev.yaml
+          kubectl kustomize deploy/overlays/prod > /tmp/jcode-prod.yaml
       - name: Verify Generator workspace mount
         run: |
-          grep -q 'name: NFS_MOUNT_PATH' generator/k8s/jcode-generator.yaml
-          grep -q 'mountPath: /nfs-data' generator/k8s/jcode-generator.yaml
-          grep -q 'claimName: jcode-vol-pvc' generator/k8s/jcode-generator.yaml
+          grep -q '^USER 1000:1000$' generator/Dockerfile
+          grep -q 'useradd --uid 1000 --gid 1000' generator/Dockerfile
+          grep -q 'name: NFS_MOUNT_PATH' deploy/base/workspace-controller.yaml
+          grep -q 'mountPath: /nfs-data' deploy/base/workspace-controller.yaml
+          grep -q 'claimName: jcode-vol-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'WATCHER_API_BASE' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'watcher-backend-service.dev.svc.cluster.local:3000' deploy/deploy.sh
+          grep -q 'watcher-backend-service.watcher.svc.cluster.local:3000' deploy/deploy.sh
+          grep -Fq "ALLOWED_NETWORK_CIDR=\"\$allowed_network_cidr\"" deploy/deploy.sh
+          grep -q 'router/k8s/configure-squid.sh' deploy/deploy.sh
+          grep -q 'acl cache_manager urlpath_regex' router/k8s/configure-squid.sh
+          grep -q 'http_access allow cache_manager workspace_network' router/k8s/configure-squid.sh
           if grep -R -q '{{HTTP_PORT}}\|{{ALLOWED_NETWORK_CIDR}}' router/k8s; then exit 1; fi
           if grep -R -nE '(^|[[:space:]])image:[[:space:]]+([^/[:space:]]+/)?[^[:space:]]+:latest|image="busybox"' generator router; then exit 1; fi
           grep -q 'WORKSPACE_INIT_IMAGE' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'volumeHandle' generator/k8s/configure-workspace-storage.sh
-          grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' router/k8s/squid-exporter.yaml
-          jq -e '.schema == 1 and .environment == "dev" and (.digests | length == 11)' deploy/release-manifest.example.json >/dev/null
+          grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' deploy/base/squid-exporter.yaml
+          jq -e '.schema == 3 and .environment == "dev" and (.revisions | length == 5) and (.digests | length == 12)' deploy/release-manifest.example.json >/dev/null
+          grep -q "const port = Number.parseInt(process.env.PORT || '3001', 10);" router/server.js
+          if grep -nEi 'refresh token extracted|Access token refreshed.*token|Token Verified Successfully.*, decoded|token refresh:.*,[[:space:]]*err[[:space:]]*\)' router/server.js; then exit 1; fi
+          grep -q 'CORS_ORIGIN: "https://your.domain"' router/k8s/jcode-router-val-ex.yaml
+          grep -q 'COOKIE_DOMAIN: "your.domain"' router/k8s/jcode-router-val-ex.yaml
+          grep -q '^## 수동 배포 순서$' deploy/README.md
+          # shellcheck disable=SC2016
+          grep -q 'deploy/deploy.sh "$TARGET_ENV"' deploy/README.md
+          grep -q 'deploy/cutover-dev.sh' deploy/README.md
+          grep -q 'WATCHER_BACKEND_DIGEST' deploy/README.md
+          grep -q 'BACKEND_DIGEST' deploy/README.md
+          grep -q 'FRONTEND_DIGEST' deploy/README.md
+          grep -q 'nodeSelector":null' deploy/README.md
+      - name: Verify controller and placement policy
+        run: |
+          if grep -R -nE 'CONTROLLER_MODE.*all|value: "all"' generator deploy; then exit 1; fi
+          if grep -nE 'V1Role\(|create_namespaced_role\(' generator/main.py; then exit 1; fi
+          if grep -R -nE 'kubernetes.io/hostname:[[:space:]]*k8s-' deploy; then exit 1; fi
+          grep -q 'name: jcode-workspace-runtime-v2' deploy/cluster/controller-rbac.yaml
+          grep -q 'resourceNames: \["jcode-workspace-runtime-v2"\]' deploy/cluster/controller-rbac.yaml
+          grep -q 'verbs: \["bind"\]' deploy/cluster/controller-rbac.yaml
+          grep -q 'kind: ValidatingAdmissionPolicy' deploy/cluster/bootstrap-boundary-policy.yaml
+          grep -q "system:serviceaccount:dev:jcode-bootstrap-v2" deploy/cluster/bootstrap-boundary-policy.yaml
+          grep -q "startsWith('jcode-dev-')" deploy/cluster/course-metadata-dev-policy.yaml
+          grep -q "startsWith('jcode-dev-')" deploy/cluster/course-metadata-prod-policy.yaml
+          if grep -q 'kubectl apply -k deploy/cluster' deploy/deploy.sh; then exit 1; fi
+          test ! -e .github/workflows/promote.yaml
+          test ! -e .github/workflows/install-cluster-v2.yaml
+          grep -q 'migrate-workspace-rbac.sh prod' deploy/install-cluster-v2.sh
+          grep -q 'finalize-workspace-rbac.sh prod' deploy/install-cluster-v2.sh
+          grep -q 'jcode-generator-dev' deploy/finalize-workspace-rbac.sh
+          grep -q 'legacy_rolebinding' generator/namespace_reconcile.py
+          grep -q 'jcode-validated-release-manifest' .github/workflows/release.yaml
+          grep -q 'ref:.*steps.release_manifest.outputs.jcode_ref' .github/workflows/cutover-dev.yaml
+          for workflow in release cutover-dev ide-images; do
+            grep -q 'workflow_call:' ".github/workflows/${workflow}.yaml"
+            if grep -q 'workflow_dispatch:' ".github/workflows/${workflow}.yaml"; then exit 1; fi
+          done
+          grep -q 'ref: develop' .github/workflows/ide-images.yaml
+          grep -q 'ref: develop' .github/workflows/release.yaml
+          grep -q 'rollout status' deploy/smoke-workspace-lifecycle.sh
+          grep -q '/healthz' deploy/smoke-workspace-lifecycle.sh
+          # 환경 변수 표현식 자체가 파일에 있는지 확인한다.
+          # shellcheck disable=SC2016
+          grep -q 'watcher_namespace=${WATCHER_NAMESPACE:-dev}' deploy/verify-release-images.sh
+          grep -q 'migration-state=quarantined' deploy/migrate-workspace-rbac.sh
+          grep -q 'SMOKE_COURSE_NAMESPACE is required for production' deploy/smoke-workspace-lifecycle.sh
+          grep -q '모든 Namespace가 안전하게 전환됐는지 먼저 확인한다' deploy/finalize-workspace-rbac.sh
+          grep -q '/api/workspace/smoke' deploy/smoke-workspace-lifecycle.sh
+          grep -q 'workspace/release-smoke/' deploy/smoke-workspace-lifecycle.sh
+          grep -q 'topologySpreadConstraints' deploy/base/router.yaml
+          grep -q 'topologySpreadConstraints' deploy/base/workspace-controller.yaml
+          grep -q 'requiredDuringSchedulingIgnoredDuringExecution' deploy/base/router.yaml
+          grep -q 'path: /ready' deploy/base/squid-exporter.yaml
+          grep -q 'automountServiceAccountToken: false' deploy/base/router.yaml
+          test "$(grep -c '^kind: Deployment$' /tmp/jcode-dev.yaml)" -eq 4
+          test "$(grep -c '^kind: Deployment$' /tmp/jcode-prod.yaml)" -eq 4
+          python - <<'PY'
+          import yaml
+
+          def load(path):
+              with open(path, encoding="utf-8") as stream:
+                  return [item for item in yaml.safe_load_all(stream) if item]
+
+          resources = load("/tmp/jcode-prod.yaml")
+          dev_resources = load("/tmp/jcode-dev.yaml")
+          cluster_resources = load("/tmp/jcode-cluster.yaml")
+          router = next(
+              item for item in resources
+              if item.get("kind") == "Deployment" and item["metadata"]["name"] == "jcode-router"
+          )
+          pod_spec = router["spec"]["template"]["spec"]
+          assert router["spec"]["replicas"] == 2
+          assert pod_spec["topologySpreadConstraints"][0]["topologyKey"] == "kubernetes.io/hostname"
+          assert pod_spec["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+          deployments = {
+              item["metadata"]["name"]: item
+              for item in resources if item.get("kind") == "Deployment"
+          }
+          assert deployments["jcode-bootstrap"]["spec"]["template"]["spec"]["serviceAccountName"] == "jcode-bootstrap-v2"
+          assert deployments["jcode-generator"]["spec"]["template"]["spec"]["serviceAccountName"] == "jcode-workspace-v2"
+          assert deployments["jcode-generator"]["spec"]["replicas"] == 2
+          assert deployments["jcode-generator"]["spec"]["template"]["spec"]["topologySpreadConstraints"]
+          for name in ("jcode-bootstrap", "jcode-generator"):
+              security = deployments[name]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+              assert security["runAsNonRoot"] is True
+              assert security["runAsUser"] == 1000
+              assert security["runAsGroup"] == 1000
+          hpa = next(item for item in resources if item.get("kind") == "HorizontalPodAutoscaler" and item["metadata"]["name"] == "jcode-generator-hpa")
+          assert hpa["spec"]["minReplicas"] == 2
+
+          dev_deployments = [item for item in dev_resources if item.get("kind") == "Deployment"]
+          assert all(item["metadata"]["namespace"] == "dev" for item in dev_deployments)
+          assert all(item["spec"]["template"]["spec"]["nodeSelector"] == {"env": "dev"} for item in dev_deployments)
+          assert all(item["spec"]["template"]["spec"]["tolerations"][0]["key"] == "dev-node" for item in dev_deployments)
+          dev_by_name = {item["metadata"]["name"]: item for item in dev_deployments}
+          for name in ("jcode-generator", "jcode-router"):
+              assert dev_by_name[name]["spec"]["strategy"] == {"type": "Recreate"}
+          for name in ("jcode-bootstrap", "jcode-generator"):
+              container = dev_by_name[name]["spec"]["template"]["spec"]["containers"][0]
+              assert container["envFrom"][0]["configMapRef"]["name"] == "jcode-generator-dev-configmap"
+              env = {item["name"]: item.get("value") for item in container["env"]}
+              assert env["JCODE_ENVIRONMENT"] == "dev"
+              assert env["COURSE_NAMESPACE_PREFIX"] == "jcode-dev-"
+          router_env_from = dev_by_name["jcode-router"]["spec"]["template"]["spec"]["containers"][0]["envFrom"]
+          assert router_env_from[0]["configMapRef"]["name"] == "jcode-router-dev-config"
+
+          dev_policies = {
+              item["metadata"]["name"]: item
+              for item in dev_resources if item.get("kind") == "NetworkPolicy"
+          }
+          prod_policies = {
+              item["metadata"]["name"]: item
+              for item in resources if item.get("kind") == "NetworkPolicy"
+          }
+          for name in ("jcode-bootstrap-backend-only", "jcode-workspace-backend-only"):
+              dev_label = dev_policies[name]["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app"]
+              prod_label = prod_policies[name]["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app"]
+              assert dev_label == "jcode-backend-dev"
+              assert prod_label == "jcode-backend"
+
+          prod_bindings = {item["metadata"]["name"] for item in resources if item.get("kind") == "ClusterRoleBinding"}
+          dev_bindings = {item["metadata"]["name"] for item in dev_resources if item.get("kind") == "ClusterRoleBinding"}
+          assert prod_bindings == {"jcode-bootstrap-v2-prod", "jcode-workspace-namespace-reader-v2-prod"}
+          assert dev_bindings == {"jcode-bootstrap-v2-dev", "jcode-workspace-namespace-reader-v2-dev"}
+          assert prod_bindings.isdisjoint(dev_bindings)
+          assert any(item.get("kind") == "ClusterRole" and item["metadata"]["name"] == "jcode-bootstrap-v2" for item in cluster_resources)
+          modes = {}
+          for name in ("jcode-bootstrap", "jcode-generator"):
+              env = deployments[name]["spec"]["template"]["spec"]["containers"][0]["env"]
+              modes[name] = next(item["value"] for item in env if item["name"] == "CONTROLLER_MODE")
+          assert modes == {"jcode-bootstrap": "bootstrap", "jcode-generator": "workspace"}
+
+          workflow = load(".github/workflows/release.yaml")[0]
+          steps = workflow["jobs"]["deploy-in-order"]["steps"]
+          names = [step.get("name") for step in steps]
+          assert names.index("Validate deployment inputs") < names.index("Login to Harbor")
+          assert names.index("Validate production smoke course") < names.index("Prepare controller permissions")
+          deploy_step = next(step for step in steps if step.get("name") == "Deploy Generator and Router second")
+          assert "SQUID_ALLOWED_NETWORK_CIDR" in deploy_step["env"]["ALLOWED_NETWORK_CIDR"]
+          revision_step = next(step for step in steps if step.get("name") == "Verify component revisions")
+          revision_script = revision_step["with"]["script"]
+          assert "for (const [repo, ref] of revisions)" in revision_script
+          assert "basehead: `${ref}...develop`" in revision_script
+          assert "`${repo} revision must belong to develop`" in revision_script
+          PY
+      - name: Verify metadata lifecycle in Kubernetes
+        run: |
+          go install sigs.k8s.io/kind@v0.27.0
+          kind_bin="$(go env GOPATH)/bin/kind"
+          trap '"$kind_bin" delete cluster --name jcode-policy' EXIT
+          "$kind_bin" create cluster --name jcode-policy --image kindest/node:v1.32.2
+          deploy/test-course-metadata-policy.sh

@@ -107,6 +107,32 @@ def test_course_namespace_metadata_cannot_be_reassigned(generator):
     assert error.value.status_code == 409
 
 
+def test_namespace_api_preserves_conflict_for_namespace_owned_by_another_course(generator, monkeypatch):
+    class ExistingCourseMetadata:
+        def read_namespaced_config_map(self, name, namespace):
+            return generator.client.V1ConfigMap(
+                data={"course-id": "11", "namespace": namespace, "environment": "prod"}
+            )
+
+    def init_with_existing_owner(core_v1_api, *args):
+        namespace = args[-3]
+        course_id = args[-2]
+        generator.ensure_course_metadata(core_v1_api, namespace, course_id)
+
+    monkeypatch.setattr(generator.client, "CoreV1Api", ExistingCourseMetadata)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: object())
+    monkeypatch.setattr(generator.client, "RbacAuthorizationV1Api", lambda: object())
+    monkeypatch.setattr(generator.client, "NetworkingV1Api", lambda: object())
+    monkeypatch.setattr(generator.client, "CustomObjectsApi", lambda: object())
+    monkeypatch.setattr(generator, "init_namespace", init_with_existing_owner)
+
+    request = generator.NamespaceRequest(course_id=12, namespace="jcode-os-1")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(generator.create_namespace_api(request, {}))
+
+    assert error.value.status_code == 409
+
+
 def test_course_namespace_metadata_is_created_immutable(generator):
     class CoreV1:
         created = None

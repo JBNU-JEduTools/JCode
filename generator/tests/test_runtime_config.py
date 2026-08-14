@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 from pathlib import Path
 
@@ -73,6 +74,40 @@ def test_nfs_mount_requires_workspace_directory(generator, monkeypatch, tmp_path
     generator.validate_nfs_mount()
 
 
+def test_smoke_workspace_paths_are_prepared_and_removed(generator, monkeypatch, tmp_path):
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(os, "chown", lambda *_: None)
+    file_path = "workspace/release-smoke/jcode-release-123-smoke"
+    student_num = "release-smoke-123"
+
+    workspace_path, extension_path = generator.prepare_smoke_workspace(file_path, student_num)
+
+    assert workspace_path.is_dir()
+    assert extension_path.is_dir()
+
+    generator.cleanup_smoke_workspace(file_path, student_num)
+
+    assert not workspace_path.exists()
+    assert not extension_path.exists()
+    assert (tmp_path / "extensions").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("file_path", "student_num"),
+    [
+        ("workspace/real-course/student", "release-smoke-123"),
+        ("workspace/release-smoke/jcode-release-123-smoke", "student-123"),
+        ("../workspace/release-smoke/jcode-release-123-smoke", "release-smoke-123"),
+    ],
+)
+def test_smoke_workspace_paths_reject_non_reserved_names(generator, monkeypatch, tmp_path, file_path, student_num):
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+
+    with pytest.raises(generator.HTTPException, match="smoke"):
+        generator.get_smoke_workspace_paths(file_path, student_num)
+
+
 def test_wait_for_external_secret_uses_ready_condition(generator, monkeypatch):
     monkeypatch.setenv("IMAGE_PULL_SECRET_NAMES", "harbor-jcode-pull")
 
@@ -122,6 +157,30 @@ def test_workspace_proxy_environment_contains_upper_and_lowercase(generator, mon
     assert values["HTTP_PROXY"] == "http://proxy.watcher.svc:3000"
     assert values["https_proxy"] == "http://proxy.watcher.svc:3000"
     assert ".svc" in values["NO_PROXY"]
+
+
+@pytest.mark.parametrize(
+    ("use_vnc", "watcher_api_base"),
+    [
+        (False, "http://watcher-backend-service.dev.svc.cluster.local:3000"),
+        (True, "http://watcher-backend-service.watcher.svc.cluster.local:3000"),
+    ],
+)
+def test_workspace_receives_environment_watcher_api(generator, monkeypatch, use_vnc, watcher_api_base):
+    monkeypatch.setenv("WATCHER_API_BASE", watcher_api_base + "/")
+
+    values = {item.name: item.value for item in generator.get_code_server_extra_env(use_vnc)}
+
+    assert values["WATCHER_API_BASE"] == watcher_api_base
+
+
+def test_workspace_watcher_api_default_follows_dev_environment(generator, monkeypatch):
+    monkeypatch.delenv("WATCHER_API_BASE", raising=False)
+    monkeypatch.setenv("JCODE_ENVIRONMENT", "dev")
+
+    values = {item.name: item.value for item in generator.get_code_server_extra_env(False)}
+
+    assert values["WATCHER_API_BASE"] == "http://watcher-backend-service.dev.svc.cluster.local:3000"
 
 
 def test_workspace_scheduling_config_is_parsed(generator, monkeypatch):

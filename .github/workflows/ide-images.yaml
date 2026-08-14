@@ -1,10 +1,14 @@
 name: JCode IDE images
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       base_digest:
         description: "CodeServer base digest"
+        required: true
+        type: string
+      base_revision:
+        description: "CodeServer base commit SHA"
         required: true
         type: string
 
@@ -20,6 +24,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: develop
+      - name: Resolve develop revision
+        run: echo "JCODE_REF=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - name: Login to Harbor
         env:
@@ -36,17 +44,24 @@ jobs:
       - name: Verify CodeServer base image
         env:
           BASE_DIGEST: ${{ inputs.base_digest }}
+          BASE_REVISION: ${{ inputs.base_revision }}
         run: |
           [[ "$BASE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$BASE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           docker buildx imagetools inspect "${REGISTRY}/${PROJECT}/jcode-codeserver@${BASE_DIGEST}"
+          tag_digest=$(docker buildx imagetools inspect "${REGISTRY}/${PROJECT}/jcode-codeserver:${BASE_REVISION}" | awk '$1 == "Digest:" {print $2; exit}')
+          [[ "$tag_digest" == "$BASE_DIGEST" ]]
       - name: Build JCode IDE image
         id: ide
         uses: docker/build-push-action@v6
         with:
           context: image/code-server
           push: true
-          build-args: JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
-          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/code-server:${{ github.sha }}
+          build-args: |
+            JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_BASE_DIGEST=${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_REVISION=${{ inputs.base_revision }}
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/code-server:${{ env.JCODE_REF }}
           provenance: true
           sbom: true
       - name: Build JCode VNC image
@@ -55,14 +70,17 @@ jobs:
         with:
           context: image/code-server-vnc
           push: true
-          build-args: JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
-          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/code-server-vnc:${{ github.sha }}
+          build-args: |
+            JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_BASE_DIGEST=${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_REVISION=${{ inputs.base_revision }}
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/code-server-vnc:${{ env.JCODE_REF }}
           provenance: true
           sbom: true
       - name: Smoke test JCode IDE images
         run: |
-          ide_image="${REGISTRY}/${PROJECT}/code-server:${GITHUB_SHA}"
-          vnc_image="${REGISTRY}/${PROJECT}/code-server-vnc:${GITHUB_SHA}"
+          ide_image="${REGISTRY}/${PROJECT}/code-server:${JCODE_REF}"
+          vnc_image="${REGISTRY}/${PROJECT}/code-server-vnc:${JCODE_REF}"
           docker run --detach --rm --name jcode-ide-smoke \
             --user 1000:1000 \
             --publish 127.0.0.1:18080:8080 \

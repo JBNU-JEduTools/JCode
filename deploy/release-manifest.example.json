@@ -1,8 +1,13 @@
 {
-  "schema": 1,
+  "schema": 3,
   "environment": "dev",
-  "jcode_ref": "0123456789abcdef0123456789abcdef01234567",
-  "watcher_ref": "89abcdef0123456789abcdef0123456789abcdef",
+  "revisions": {
+    "jcode": "0123456789abcdef0123456789abcdef01234567",
+    "backend": "123456789abcdef0123456789abcdef012345678",
+    "frontend": "23456789abcdef0123456789abcdef0123456789",
+    "watcher": "89abcdef0123456789abcdef0123456789abcdef",
+    "code_server": "3456789abcdef0123456789abcdef0123456789a"
+  },
   "digests": {
     "watcher_backend": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
     "watcher_filemon": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
@@ -11,6 +16,7 @@
     "router": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
     "code_server": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
     "code_server_vnc": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
+    "code_server_base": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
     "workspace_init": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
     "squid_exporter": "sha256:REPLACE_WITH_VERIFIED_DIGEST",
     "backend": "sha256:REPLACE_WITH_VERIFIED_DIGEST",

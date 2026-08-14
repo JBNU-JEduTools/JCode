@@ -24,6 +24,7 @@ data:
   CODE_SERVER_VNC_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
   WORKSPACE_ROOT: "/home/coder/project"
   WATCHER_NAMESPACE: "watcher"
+  WATCHER_API_BASE: "http://watcher-backend-service.watcher.svc.cluster.local:3000"
   WORKSPACE_PROXY_URL: "http://jcode-router-svc.watcher.svc.cluster.local:3000"
   WORKSPACE_PROXY_NAMESPACE: "watcher"
   WORKSPACE_PROXY_POD_LABEL: "jcode-router"

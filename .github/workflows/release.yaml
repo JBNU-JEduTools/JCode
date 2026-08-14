@@ -1,23 +1,38 @@
 name: Deploy platform release
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       target:
         description: "Deployment environment"
         required: true
-        type: choice
-        options: [dev, production]
+        type: string
       digests:
-        description: "Dev only: JSON containing the eleven image digests"
+        description: "Dev only: JSON containing the twelve image digests"
         required: false
         type: string
       watcher_ref:
         description: "Dev only: full Watcher commit SHA"
         required: false
         type: string
-      dev_run_id:
-        description: "Production only: successful dev release run ID"
+      backend_ref:
+        description: "Dev only: full Backend commit SHA"
+        required: false
+        type: string
+      frontend_ref:
+        description: "Dev only: full Frontend commit SHA"
+        required: false
+        type: string
+      code_server_ref:
+        description: "Dev only: full CodeServer commit SHA"
+        required: false
+        type: string
+      cutover_run_id:
+        description: "Production only: successful dev cutover run ID"
+        required: false
+        type: string
+      smoke_course_namespace:
+        description: "Production only: existing course namespace used for lifecycle verification"
         required: false
         type: string
 
@@ -34,29 +49,72 @@ jobs:
     runs-on: ubuntu-22.04
     environment: ${{ inputs.target }}
     steps:
+      - name: Checkout develop release code
+        if: inputs.target == 'dev'
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+      - name: Resolve develop revision
+        if: inputs.target == 'dev'
+        run: echo "JCODE_REF=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Create dev release manifest
         if: inputs.target == 'dev'
         env:
           RELEASE_DIGESTS: ${{ inputs.digests }}
           WATCHER_REF_INPUT: ${{ inputs.watcher_ref }}
+          BACKEND_REF_INPUT: ${{ inputs.backend_ref }}
+          FRONTEND_REF_INPUT: ${{ inputs.frontend_ref }}
+          CODE_SERVER_REF_INPUT: ${{ inputs.code_server_ref }}
         run: |
-          [[ "$WATCHER_REF_INPUT" =~ ^[0-9a-f]{40}$ ]]
+          for revision in "$JCODE_REF" "$WATCHER_REF_INPUT" "$BACKEND_REF_INPUT" "$FRONTEND_REF_INPUT" "$CODE_SERVER_REF_INPUT"; do
+            [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          done
           test -n "$RELEASE_DIGESTS"
           mkdir -p "$RUNNER_TEMP/release-input"
           jq -n \
-            --arg jcode_ref "$GITHUB_SHA" \
+            --arg jcode_ref "$JCODE_REF" \
             --arg watcher_ref "$WATCHER_REF_INPUT" \
+            --arg backend_ref "$BACKEND_REF_INPUT" \
+            --arg frontend_ref "$FRONTEND_REF_INPUT" \
+            --arg code_server_ref "$CODE_SERVER_REF_INPUT" \
             --argjson digests "$RELEASE_DIGESTS" \
-            '{schema:1,environment:"dev",jcode_ref:$jcode_ref,watcher_ref:$watcher_ref,digests:$digests}' \
+            '{schema:3,environment:"dev",revisions:{jcode:$jcode_ref,backend:$backend_ref,frontend:$frontend_ref,watcher:$watcher_ref,code_server:$code_server_ref},digests:$digests}' \
             > "$RUNNER_TEMP/release-input/release-manifest.json"
-      - name: Validate successful dev run
+      - name: Validate deployment inputs
+        env:
+          TARGET: ${{ inputs.target }}
+          CUTOVER_RUN_ID: ${{ inputs.cutover_run_id }}
+          SMOKE_COURSE_NAMESPACE: ${{ inputs.smoke_course_namespace }}
+          JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
+          BACKEND_NAMESPACE: ${{ vars.BACKEND_NAMESPACE }}
+          BACKEND_DEPLOYMENT: ${{ vars.BACKEND_DEPLOYMENT }}
+          BACKEND_CONTAINER: ${{ vars.BACKEND_CONTAINER }}
+          FRONTEND_NAMESPACE: ${{ vars.FRONTEND_NAMESPACE }}
+          FRONTEND_DEPLOYMENT: ${{ vars.FRONTEND_DEPLOYMENT }}
+          FRONTEND_CONTAINER: ${{ vars.FRONTEND_CONTAINER }}
+          SQUID_ALLOWED_NETWORK_CIDR: ${{ vars.SQUID_ALLOWED_NETWORK_CIDR }}
+        run: |
+          [[ "$TARGET" == dev || "$TARGET" == production ]]
+          for variable in JCODE_NAMESPACE BACKEND_NAMESPACE BACKEND_DEPLOYMENT BACKEND_CONTAINER FRONTEND_NAMESPACE FRONTEND_DEPLOYMENT FRONTEND_CONTAINER SQUID_ALLOWED_NETWORK_CIDR; do
+            [[ -n "${!variable}" ]] || { echo "$variable is required" >&2; exit 2; }
+          done
+          if [[ "$TARGET" == dev ]]; then
+            [[ "$JCODE_NAMESPACE" == dev ]]
+          else
+            [[ "$JCODE_NAMESPACE" == watcher ]]
+            [[ "$CUTOVER_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$SMOKE_COURSE_NAMESPACE" =~ ^jcode-[a-z0-9]+-[0-9]+$ ]]
+            [[ "$SMOKE_COURSE_NAMESPACE" != jcode-dev-* ]]
+          fi
+      - name: Validate successful dev cutover
         if: inputs.target == 'production'
         uses: actions/github-script@v7
         with:
           script: |
-            const runId = Number('${{ inputs.dev_run_id }}');
+            const runId = Number('${{ inputs.cutover_run_id }}');
             if (!Number.isSafeInteger(runId) || runId <= 0) {
-              core.setFailed('dev_run_id must be a positive workflow run ID');
+              core.setFailed('cutover_run_id must be a positive workflow run ID');
               return;
             }
             const {data: run} = await github.rest.actions.getWorkflowRun({
@@ -64,34 +122,44 @@ jobs:
               repo: context.repo.repo,
               run_id: runId,
             });
-            if (run.event !== 'workflow_dispatch' || run.path !== '.github/workflows/release.yaml' || run.conclusion !== 'success') {
-              core.setFailed('production requires a successful dev run of release.yaml');
+            if (run.event !== 'workflow_dispatch' || run.path !== '.github/workflows/cutover-dev.yaml' || run.conclusion !== 'success') {
+              core.setFailed('production requires a successful dev cutover run');
             }
-      - name: Download dev release manifest
+            if (run.head_branch !== context.payload.repository.default_branch) {
+              core.setFailed('cutover must be started from the default-branch dispatcher');
+            }
+      - name: Download validated dev release manifest
         if: inputs.target == 'production'
         uses: actions/download-artifact@v4
         with:
-          name: jcode-release-manifest
+          name: jcode-validated-release-manifest
           path: ${{ runner.temp }}/release-input
           repository: ${{ github.repository }}
-          run-id: ${{ inputs.dev_run_id }}
+          run-id: ${{ inputs.cutover_run_id }}
           github-token: ${{ github.token }}
       - name: Load immutable release manifest
         run: |
           manifest="$RUNNER_TEMP/release-input/release-manifest.json"
           test -f "$manifest"
           jq -e '
-            .schema == 1 and
+            .schema == 3 and
             .environment == "dev" and
-            (.digests | type == "object" and length == 11)
+            (.revisions | type == "object" and length == 5) and
+            (.digests | type == "object" and length == 12)
           ' "$manifest" >/dev/null
 
-          jcode_ref=$(jq -er '.jcode_ref' "$manifest")
-          watcher_ref=$(jq -er '.watcher_ref' "$manifest")
-          [[ "$jcode_ref" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$watcher_ref" =~ ^[0-9a-f]{40}$ ]]
-          echo "JCODE_REF=$jcode_ref" >> "$GITHUB_ENV"
-          echo "WATCHER_REF=$watcher_ref" >> "$GITHUB_ENV"
+          for mapping in \
+            "JCODE_REF:jcode" \
+            "BACKEND_REF:backend" \
+            "FRONTEND_REF:frontend" \
+            "WATCHER_REF:watcher" \
+            "CODE_SERVER_REF:code_server"; do
+            variable="${mapping%%:*}"
+            key="${mapping#*:}"
+            revision=$(jq -er --arg key "$key" '.revisions[$key]' "$manifest")
+            [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+            echo "${variable}=${revision}" >> "$GITHUB_ENV"
+          done
 
           for mapping in \
             "WATCHER_BACKEND_DIGEST:watcher_backend" \
@@ -101,6 +169,7 @@ jobs:
             "ROUTER_DIGEST:router" \
             "CODE_SERVER_DIGEST:code_server" \
             "CODE_SERVER_VNC_DIGEST:code_server_vnc" \
+            "CODE_SERVER_BASE_DIGEST:code_server_base" \
             "WORKSPACE_INIT_DIGEST:workspace_init" \
             "SQUID_EXPORTER_DIGEST:squid_exporter" \
             "BACKEND_DIGEST:backend" \
@@ -112,6 +181,39 @@ jobs:
             echo "${variable}=${digest}" >> "$GITHUB_ENV"
           done
           echo "RELEASE_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Verify component revisions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const revisions = [
+              ['JCode', process.env.JCODE_REF],
+              ['JCode-Backend', process.env.BACKEND_REF],
+              ['JCode-Frontend', process.env.FRONTEND_REF],
+              ['JCode-Watcher', process.env.WATCHER_REF],
+              ['JCode-CodeServer', process.env.CODE_SERVER_REF],
+            ];
+            for (const [repo, ref] of revisions) {
+              try {
+                const {data: commit} = await github.rest.repos.getCommit({
+                  owner: 'mindungil',
+                  repo,
+                  ref,
+                });
+                if (commit.sha !== ref) {
+                  core.setFailed(`${repo} revision does not resolve to the requested commit`);
+                }
+                const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: 'mindungil',
+                  repo,
+                  basehead: `${ref}...develop`,
+                });
+                if (!['ahead', 'identical'].includes(comparison.status)) {
+                  core.setFailed(`${repo} revision must belong to develop`);
+                }
+              } catch (error) {
+                core.setFailed(`${repo} revision could not be verified: ${error.message}`);
+              }
+            }
       - name: Checkout JCode release code
         uses: actions/checkout@v4
         with:
@@ -145,6 +247,7 @@ jobs:
             "jdevops|jcode-router|${ROUTER_DIGEST}" \
             "jdevops|code-server|${CODE_SERVER_DIGEST}" \
             "jdevops|code-server-vnc|${CODE_SERVER_VNC_DIGEST}" \
+            "jdevops|jcode-codeserver|${CODE_SERVER_BASE_DIGEST}" \
             "jdevops|workspace-init|${WORKSPACE_INIT_DIGEST}" \
             "jdevops|squid-exporter|${SQUID_EXPORTER_DIGEST}" \
             "jdevops|jcode-backend|${BACKEND_DIGEST}" \
@@ -152,11 +255,63 @@ jobs:
             IFS='|' read -r project component digest <<< "$entry"
             docker buildx imagetools inspect "harbor.jbnu.ac.kr/${project}/${component}@${digest}"
           done
+      - name: Match revisions to image digests
+        run: |
+          verify_revision_digest() {
+            local component=$1 revision=$2 expected_digest=$3
+            local image="harbor.jbnu.ac.kr/jdevops/${component}:${revision}"
+            local actual_digest
+            actual_digest=$(docker buildx imagetools inspect "$image" | awk '$1 == "Digest:" {print $2; exit}')
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "$component revision tag resolves to $actual_digest, expected $expected_digest" >&2
+              exit 1
+            fi
+          }
+
+          verify_revision_digest watcher-backend "$WATCHER_REF" "$WATCHER_BACKEND_DIGEST"
+          verify_revision_digest watcher-filemon "$WATCHER_REF" "$WATCHER_FILEMON_DIGEST"
+          verify_revision_digest watcher-procmon "$WATCHER_REF" "$WATCHER_PROCMON_DIGEST"
+          verify_revision_digest jcode-generator "$JCODE_REF" "$GENERATOR_DIGEST"
+          verify_revision_digest jcode-router "$JCODE_REF" "$ROUTER_DIGEST"
+          verify_revision_digest code-server "$JCODE_REF" "$CODE_SERVER_DIGEST"
+          verify_revision_digest code-server-vnc "$JCODE_REF" "$CODE_SERVER_VNC_DIGEST"
+          verify_revision_digest workspace-init "$JCODE_REF" "$WORKSPACE_INIT_DIGEST"
+          verify_revision_digest squid-exporter "$JCODE_REF" "$SQUID_EXPORTER_DIGEST"
+          verify_revision_digest jcode-backend "$BACKEND_REF" "$BACKEND_DIGEST"
+          verify_revision_digest jcode-front "$FRONTEND_REF" "$FRONTEND_DIGEST"
+          verify_revision_digest jcode-codeserver "$CODE_SERVER_REF" "$CODE_SERVER_BASE_DIGEST"
+
+          for component in code-server code-server-vnc; do
+            digest_variable=CODE_SERVER_DIGEST
+            [[ "$component" == code-server-vnc ]] && digest_variable=CODE_SERVER_VNC_DIGEST
+            digest=${!digest_variable}
+            image="harbor.jbnu.ac.kr/jdevops/${component}@${digest}"
+            docker pull "$image"
+            [[ $(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image") == "$CODE_SERVER_REF" ]]
+            [[ $(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' "$image") == "$CODE_SERVER_BASE_DIGEST" ]]
+          done
       - uses: azure/setup-kubectl@v4
       - uses: azure/k8s-set-context@v4
         with:
           method: kubeconfig
           kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      - name: Validate production smoke course
+        if: inputs.target == 'production'
+        env:
+          SMOKE_COURSE_NAMESPACE: ${{ inputs.smoke_course_namespace }}
+        run: |
+          kubectl get namespace "$SMOKE_COURSE_NAMESPACE" >/dev/null
+          [[ $(kubectl get namespace "$SMOKE_COURSE_NAMESPACE" -o jsonpath='{.metadata.labels.jcode\.io/migration-state}') != quarantined ]]
+          metadata=$(kubectl get configmap jcode-course-metadata -n "$SMOKE_COURSE_NAMESPACE" -o json)
+          course_id=$(jq -er '.data["course-id"]' <<<"$metadata")
+          [[ "$course_id" =~ ^[1-9][0-9]*$ ]]
+          [[ $(jq -r '.data.namespace' <<<"$metadata") == "$SMOKE_COURSE_NAMESPACE" ]]
+          bindings=$(kubectl get rolebindings -n "$SMOKE_COURSE_NAMESPACE" -o json)
+          jq -e 'any(.items[].subjects[]?; .kind == "ServiceAccount" and .namespace == "watcher" and (.name == "jcode-workspace" or .name == "jcode-workspace-v2"))' <<<"$bindings" >/dev/null
+      - name: Prepare controller permissions
+        env:
+          CONFIRM_PROD_V2_PREPARE: ${{ inputs.target == 'production' && 'prod-prepare' || '' }}
+        run: deploy/install-cluster-v2.sh prepare "${{ inputs.target }}"
       - name: Deploy Watcher first
         env:
           TARGET: ${{ inputs.target }}
@@ -169,8 +324,10 @@ jobs:
           deploy/deploy.sh "$TARGET"
       - name: Deploy Generator and Router second
         env:
+          TARGET: ${{ inputs.target }}
           JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
-        run: deploy/deploy.sh
+          ALLOWED_NETWORK_CIDR: ${{ vars.SQUID_ALLOWED_NETWORK_CIDR }}
+        run: deploy/deploy.sh "$TARGET"
       - name: Deploy portal Backend third
         env:
           KUBE_NAMESPACE: ${{ vars.BACKEND_NAMESPACE }}
@@ -195,6 +352,34 @@ jobs:
           image="harbor.jbnu.ac.kr/jdevops/jcode-front@${FRONTEND_DIGEST}"
           kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
           kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
+      - name: Verify production release
+        if: inputs.target == 'production'
+        env:
+          BACKEND_NAMESPACE: ${{ vars.BACKEND_NAMESPACE }}
+          BACKEND_DEPLOYMENT: ${{ vars.BACKEND_DEPLOYMENT }}
+          BACKEND_CONTAINER: ${{ vars.BACKEND_CONTAINER }}
+          FRONTEND_NAMESPACE: ${{ vars.FRONTEND_NAMESPACE }}
+          FRONTEND_DEPLOYMENT: ${{ vars.FRONTEND_DEPLOYMENT }}
+          FRONTEND_CONTAINER: ${{ vars.FRONTEND_CONTAINER }}
+          WATCHER_NAMESPACE: ${{ vars.WATCHER_NAMESPACE }}
+          SMOKE_COURSE_NAMESPACE: ${{ inputs.smoke_course_namespace }}
+        run: |
+          manifest="$RUNNER_TEMP/release-input/release-manifest.json"
+          deploy/verify-release-images.sh "$manifest" production
+          kubectl port-forward -n watcher service/jcode-generator-svc 15001:5000 > "$RUNNER_TEMP/production-workspace-port-forward.log" 2>&1 &
+          workspace_pid=$!
+          trap 'kill "$workspace_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl --fail --silent --output /dev/null http://127.0.0.1:15001/health/ready && break
+            sleep 1
+          done
+          curl --fail --silent --output /dev/null http://127.0.0.1:15001/health/ready
+          WORKSPACE_URL=http://127.0.0.1:15001 deploy/smoke-workspace-lifecycle.sh production
+      - name: Finalize production permissions
+        if: inputs.target == 'production'
+        env:
+          CONFIRM_PROD_V2_FINALIZE: prod-after-rollout
+        run: deploy/install-cluster-v2.sh finalize production
       - name: Publish dev release manifest
         if: inputs.target == 'dev'
         uses: actions/upload-artifact@v4

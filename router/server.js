@@ -10,7 +10,7 @@ const client = require('prom-client');  // prometheus client
 require('dotenv').config();
 
 const app = express();
-const port = 3001;
+const port = Number.parseInt(process.env.PORT || '3001', 10);
 
 ///////////////////////////////////// prometheus client  //////////////////////////////////////////
 
@@ -159,21 +159,20 @@ const refreshAccessToken = async (req, res, next, currentToken) => {
           const match = newRefreshCookie.match(/^jcodeRt=([^;]+);/);
           if (match && match[1]) {
             const newRefreshToken = match[1];
-            console.log("New refresh token extracted:", newRefreshToken);
             res.cookie('jcodeRt', newRefreshToken, cookieOptions);
             req.cookies.refreshToken = newRefreshToken;
           }
         }
       }
       
-      console.log("Access token refreshed:", token);
+      console.log("Access token refreshed");
       return next();
     } else {
       console.error("Authorization header not found in refresh response");
       return closeWindowWithMessage(res, 500, "인증 재발급 중 오류가 발생했습니다. 다시 시도해주세요.");
     }
   } catch (err) {
-    console.error("Error during token refresh:", err);
+    console.error("Error during token refresh:", err.message);
     return closeWindowWithMessage(res, 500, "인증 재발급에 실패했습니다. 다시 시도해주세요.");
   }
 };
@@ -219,7 +218,7 @@ const verifyTokenFromCookie = (req, res, next) => {
       return closeWindowWithMessage(res, 403, "인증에 실패하였습니다. 다시 시도해주세요.");
     }
     req.user = decoded;
-    console.log("Token Verified Successfully:", decoded);
+    console.log("Token verified successfully");
     next();
   });
 };

@@ -38,6 +38,20 @@ patches:
         path: /spec/namespaceSelector/matchNames/0
         value: dev
   - target:
+      kind: NetworkPolicy
+      name: jcode-bootstrap-backend-only
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/podSelector/matchLabels/app
+        value: jcode-backend-dev
+  - target:
+      kind: NetworkPolicy
+      name: jcode-workspace-backend-only
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from/0/podSelector/matchLabels/app
+        value: jcode-backend-dev
+  - target:
       kind: Deployment
       name: jcode-generator
     patch: |-
@@ -46,6 +60,8 @@ patches:
       metadata:
         name: jcode-generator
       spec:
+        strategy:
+          type: Recreate
         template:
           spec:
             containers:
@@ -96,6 +112,8 @@ patches:
       metadata:
         name: jcode-router
       spec:
+        strategy:
+          type: Recreate
         template:
           spec:
             containers:

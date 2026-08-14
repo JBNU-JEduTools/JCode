@@ -36,7 +36,34 @@ trap 'rm -f "$config_file"' EXIT
   echo "cache_mem 0 MB"
 } > "$config_file"
 
+for required_line in \
+  "acl workspace_network src ${allowed_cidr}" \
+  "acl cache_manager urlpath_regex -i ^/squid-internal-mgr/" \
+  "http_access allow cache_manager workspace_network" \
+  "http_access deny cache_manager" \
+  "http_access allow workspace_network" \
+  "http_access deny all"; do
+  grep -Fxq "$required_line" "$config_file" || {
+    echo "generated squid.conf is missing: $required_line" >&2
+    exit 2
+  }
+done
+
 kubectl create configmap squid-config \
   --namespace "$namespace" \
   --from-file="squid.conf=${config_file}" \
   --dry-run=client -o yaml | kubectl apply -f -
+
+applied_config=$(kubectl get configmap squid-config --namespace "$namespace" -o jsonpath='{.data.squid\.conf}')
+for required_line in \
+  "acl workspace_network src ${allowed_cidr}" \
+  "acl cache_manager urlpath_regex -i ^/squid-internal-mgr/" \
+  "http_access allow cache_manager workspace_network" \
+  "http_access deny cache_manager" \
+  "http_access allow workspace_network" \
+  "http_access deny all"; do
+  grep -Fxq "$required_line" <<<"$applied_config" || {
+    echo "applied squid.conf is missing: $required_line" >&2
+    exit 2
+  }
+done
