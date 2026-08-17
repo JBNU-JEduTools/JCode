@@ -22,6 +22,10 @@ spec:
         app: jcode-bootstrap
     spec:
       serviceAccountName: jcode-bootstrap-v2
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "2"
       securityContext:
         seccompProfile:
           type: RuntimeDefault

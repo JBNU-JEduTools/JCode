@@ -22,6 +22,10 @@ spec:
         app: jcode-generator
     spec:
       serviceAccountName: jcode-workspace-v2
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "2"
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname

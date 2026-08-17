@@ -8,13 +8,6 @@ on:
       - 'router/**'
       - 'image/workspace-init/**'
       - 'image/squid-exporter/**'
-  push:
-    branches: [develop]
-    paths:
-      - 'generator/**'
-      - 'router/**'
-      - 'image/workspace-init/**'
-      - 'image/squid-exporter/**'
 
 permissions:
   contents: read
@@ -41,25 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Login to Harbor
-        if: github.event_name == 'push'
-        env:
-          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if printf '%s' "$HARBOR_PASSWORD" | timeout 30 docker login "$REGISTRY" --username "$HARBOR_USERNAME" --password-stdin; then
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          exit 1
       - name: Build immutable image
         id: image
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
-          push: ${{ github.event_name == 'push' }}
+          push: false
           tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.component }}:${{ github.sha }}
           provenance: true
           sbom: true

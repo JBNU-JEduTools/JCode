@@ -1,5 +1,5 @@
 # 1. 빌드 스테이지 (Node.js 의존성 설치)
-FROM node:18-alpine AS build
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43 AS build
 WORKDIR /app
 
 # package.json과 package-lock.json을 먼저 복사하여 캐시 활용
@@ -9,7 +9,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 # 2. 런타임 스테이지 (Squid + Node.js 실행)
-FROM node:18-alpine
+FROM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
 
 WORKDIR /app
 

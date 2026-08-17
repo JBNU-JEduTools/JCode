@@ -94,11 +94,24 @@ jobs:
           FRONTEND_DEPLOYMENT: ${{ vars.FRONTEND_DEPLOYMENT }}
           FRONTEND_CONTAINER: ${{ vars.FRONTEND_CONTAINER }}
           SQUID_ALLOWED_NETWORK_CIDR: ${{ vars.SQUID_ALLOWED_NETWORK_CIDR }}
+          WORKSPACE_DNS_CIDRS: ${{ vars.WORKSPACE_DNS_CIDRS }}
         run: |
           [[ "$TARGET" == dev || "$TARGET" == production ]]
-          for variable in JCODE_NAMESPACE BACKEND_NAMESPACE BACKEND_DEPLOYMENT BACKEND_CONTAINER FRONTEND_NAMESPACE FRONTEND_DEPLOYMENT FRONTEND_CONTAINER SQUID_ALLOWED_NETWORK_CIDR; do
+          for variable in JCODE_NAMESPACE BACKEND_NAMESPACE BACKEND_DEPLOYMENT BACKEND_CONTAINER FRONTEND_NAMESPACE FRONTEND_DEPLOYMENT FRONTEND_CONTAINER SQUID_ALLOWED_NETWORK_CIDR WORKSPACE_DNS_CIDRS; do
             [[ -n "${!variable}" ]] || { echo "$variable is required" >&2; exit 2; }
           done
+          python3 - "$WORKSPACE_DNS_CIDRS" <<'PY'
+          import ipaddress
+          import sys
+
+          values = [value.strip() for value in sys.argv[1].split(",") if value.strip()]
+          if not values:
+              raise SystemExit("WORKSPACE_DNS_CIDRS is required")
+          for value in values:
+              if "/" not in value:
+                  raise SystemExit(f"invalid WORKSPACE_DNS_CIDRS: {value}")
+              ipaddress.ip_network(value, strict=True)
+          PY
           if [[ "$TARGET" == dev ]]; then
             [[ "$JCODE_NAMESPACE" == dev ]]
           else
@@ -327,6 +340,7 @@ jobs:
           TARGET: ${{ inputs.target }}
           JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
           ALLOWED_NETWORK_CIDR: ${{ vars.SQUID_ALLOWED_NETWORK_CIDR }}
+          WORKSPACE_DNS_CIDRS: ${{ vars.WORKSPACE_DNS_CIDRS }}
         run: deploy/deploy.sh "$TARGET"
       - name: Deploy portal Backend third
         env:

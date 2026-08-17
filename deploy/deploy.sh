@@ -11,6 +11,8 @@ case "$target" in
     router_configmap=jcode-router-dev-config
     router_secret=jcode-router-dev-secret
     watcher_api_base=http://watcher-backend-service.dev.svc.cluster.local:3000
+    watcher_namespace=dev
+    workspace_proxy_namespace=dev
     ;;
   prod|production)
     overlay=prod
@@ -20,6 +22,8 @@ case "$target" in
     router_configmap=jcode-router-config
     router_secret=jcode-router-secret
     watcher_api_base=http://watcher-backend-service.watcher.svc.cluster.local:3000
+    watcher_namespace=watcher
+    workspace_proxy_namespace=watcher
     ;;
   *)
     echo "target must be dev, prod, or production: $target" >&2
@@ -38,6 +42,7 @@ code_server_vnc_digest=${CODE_SERVER_VNC_DIGEST:?CODE_SERVER_VNC_DIGEST is requi
 workspace_init_digest=${WORKSPACE_INIT_DIGEST:?WORKSPACE_INIT_DIGEST is required}
 squid_exporter_digest=${SQUID_EXPORTER_DIGEST:?SQUID_EXPORTER_DIGEST is required}
 allowed_network_cidr=${ALLOWED_NETWORK_CIDR:?ALLOWED_NETWORK_CIDR is required}
+workspace_dns_cidrs=${WORKSPACE_DNS_CIDRS:?WORKSPACE_DNS_CIDRS is required}
 
 for digest in "$generator_digest" "$router_digest" "$code_server_digest" "$code_server_vnc_digest" "$workspace_init_digest" "$squid_exporter_digest"; do
   if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -45,7 +50,7 @@ for digest in "$generator_digest" "$router_digest" "$code_server_digest" "$code_
     exit 2
   fi
 done
-python3 - "$allowed_network_cidr" <<'PY'
+python3 - "$allowed_network_cidr" "$workspace_dns_cidrs" <<'PY'
 import ipaddress
 import sys
 
@@ -53,6 +58,17 @@ try:
     ipaddress.ip_network(sys.argv[1], strict=False)
 except ValueError as error:
     raise SystemExit(f"ALLOWED_NETWORK_CIDR is invalid: {error}")
+
+dns_cidrs = [value.strip() for value in sys.argv[2].split(",") if value.strip()]
+if not dns_cidrs:
+    raise SystemExit("WORKSPACE_DNS_CIDRS must contain at least one CIDR")
+for value in dns_cidrs:
+    if "/" not in value:
+        raise SystemExit(f"WORKSPACE_DNS_CIDRS contains an invalid CIDR: {value}")
+    try:
+        ipaddress.ip_network(value, strict=True)
+    except ValueError as error:
+        raise SystemExit(f"WORKSPACE_DNS_CIDRS contains an invalid CIDR ({value}): {error}")
 PY
 
 for resource in \
@@ -133,7 +149,10 @@ jq -n \
   --arg code_server_vnc_image "harbor.jbnu.ac.kr/jdevops/code-server-vnc@$code_server_vnc_digest" \
   --arg workspace_init_image "harbor.jbnu.ac.kr/jdevops/workspace-init@$workspace_init_digest" \
   --arg watcher_api_base "$watcher_api_base" \
-  '{data:{CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base}}' \
+  --arg workspace_dns_cidrs "$workspace_dns_cidrs" \
+  --arg watcher_namespace "$watcher_namespace" \
+  --arg workspace_proxy_namespace "$workspace_proxy_namespace" \
+  '{data:{CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000"}}' \
   > "$config_patch"
 kubectl patch configmap "$generator_configmap" -n "$namespace" --type=merge --patch-file "$config_patch"
 kubectl apply -f "$render_dir/platform.yaml"
@@ -143,3 +162,7 @@ kubectl rollout status deployment/jcode-generator -n "$namespace" --timeout=5m
 kubectl rollout status deployment/jcode-bootstrap -n "$namespace" --timeout=5m
 kubectl rollout status deployment/jcode-router -n "$namespace" --timeout=5m
 kubectl rollout status deployment/squid-exporter -n "$namespace" --timeout=5m
+
+python3 deploy/reconcile_workspace_dns.py "$overlay" \
+  --namespace "$namespace" \
+  --configmap "$generator_configmap"

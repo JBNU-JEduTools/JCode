@@ -51,7 +51,11 @@ jobs:
           bash -n deploy/verify-release-images.sh
           bash -n deploy/install-cluster-v2.sh
           bash -n deploy/cutover-dev.sh
+          bash -n deploy/update-backend-generator-config.sh
+          bash -n deploy/test-followup-scripts.sh
+          deploy/test-followup-scripts.sh
           bash -n deploy/deploy.sh
+          python3 -m unittest deploy/test_reconcile_workspace_dns.py
           jq -e '
             .schema == 1 and
             .environments.dev["jcode-dev-1"].action == "quarantine" and
@@ -70,6 +74,9 @@ jobs:
           grep -q 'mountPath: /nfs-data' deploy/base/workspace-controller.yaml
           grep -q 'claimName: jcode-vol-pvc' deploy/base/workspace-controller.yaml
           grep -q 'WATCHER_API_BASE' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'WORKSPACE_DNS_CIDRS' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'WORKSPACE_DNS_CIDRS' deploy/deploy.sh
+          grep -q 'reconcile_workspace_dns.py' deploy/deploy.sh
           grep -q 'watcher-backend-service.dev.svc.cluster.local:3000' deploy/deploy.sh
           grep -q 'watcher-backend-service.watcher.svc.cluster.local:3000' deploy/deploy.sh
           grep -Fq "ALLOWED_NETWORK_CIDR=\"\$allowed_network_cidr\"" deploy/deploy.sh
@@ -112,6 +119,11 @@ jobs:
           grep -q 'migrate-workspace-rbac.sh prod' deploy/install-cluster-v2.sh
           grep -q 'finalize-workspace-rbac.sh prod' deploy/install-cluster-v2.sh
           grep -q 'jcode-generator-dev' deploy/finalize-workspace-rbac.sh
+          grep -q 'unsafe_legacy_cluster_bindings' deploy/finalize-workspace-rbac.sh
+          grep -q 'remaining_cluster_bindings' deploy/finalize-workspace-rbac.sh
+          grep -q 'update-backend-generator-config.sh' deploy/cutover-dev.sh
+          if sed -n '/^on:/,/^permissions:/p' .github/workflows/images.yaml | grep -q '^  push:'; then exit 1; fi
+          grep -q 'push: false' .github/workflows/images.yaml
           grep -q 'legacy_rolebinding' generator/namespace_reconcile.py
           grep -q 'jcode-validated-release-manifest' .github/workflows/release.yaml
           grep -q 'ref:.*steps.release_manifest.outputs.jcode_ref' .github/workflows/cutover-dev.yaml
@@ -165,6 +177,7 @@ jobs:
           assert deployments["jcode-generator"]["spec"]["replicas"] == 2
           assert deployments["jcode-generator"]["spec"]["template"]["spec"]["topologySpreadConstraints"]
           for name in ("jcode-bootstrap", "jcode-generator"):
+              assert deployments[name]["spec"]["template"]["spec"]["dnsConfig"]["options"] == [{"name": "ndots", "value": "2"}]
               security = deployments[name]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
               assert security["runAsNonRoot"] is True
               assert security["runAsUser"] == 1000
@@ -221,6 +234,10 @@ jobs:
           assert names.index("Validate production smoke course") < names.index("Prepare controller permissions")
           deploy_step = next(step for step in steps if step.get("name") == "Deploy Generator and Router second")
           assert "SQUID_ALLOWED_NETWORK_CIDR" in deploy_step["env"]["ALLOWED_NETWORK_CIDR"]
+          assert "WORKSPACE_DNS_CIDRS" in deploy_step["env"]
+          assert "169.254.25.10/32" not in deploy_step["env"]["WORKSPACE_DNS_CIDRS"]
+          validate_step = next(step for step in steps if step.get("name") == "Validate deployment inputs")
+          assert "WORKSPACE_DNS_CIDRS" in validate_step["env"]
           revision_step = next(step for step in steps if step.get("name") == "Verify component revisions")
           revision_script = revision_step["with"]["script"]
           assert "for (const [repo, ref] of revisions)" in revision_script
@@ -234,3 +251,30 @@ jobs:
           trap '"$kind_bin" delete cluster --name jcode-policy' EXIT
           "$kind_bin" create cluster --name jcode-policy --image kindest/node:v1.32.2
           deploy/test-course-metadata-policy.sh
+          kubectl delete namespace dev watcher --ignore-not-found --wait=true
+          kubectl create namespace dev
+          kubectl create namespace watcher
+          kubectl apply -f - <<'EOF'
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: servicemonitors.monitoring.coreos.com
+          spec:
+            group: monitoring.coreos.com
+            names:
+              kind: ServiceMonitor
+              plural: servicemonitors
+              singular: servicemonitor
+            scope: Namespaced
+            versions:
+              - name: v1
+                served: true
+                storage: true
+                schema:
+                  openAPIV3Schema:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+          EOF
+          kubectl apply --server-side --dry-run=server -f /tmp/jcode-cluster.yaml >/dev/null
+          kubectl apply --server-side --dry-run=server -f /tmp/jcode-dev.yaml >/dev/null
+          kubectl apply --server-side --dry-run=server -f /tmp/jcode-prod.yaml >/dev/null

@@ -6,6 +6,7 @@ backend_namespace=${BACKEND_NAMESPACE:-dev}
 backend_configmap=${BACKEND_CONFIGMAP:-}
 backend_deployment=${BACKEND_DEPLOYMENT:?BACKEND_DEPLOYMENT is required}
 backup_dir=${CUTOVER_BACKUP_DIR:-cutover-backup}
+backend_config_script=${BACKEND_CONFIG_SCRIPT:-deploy/update-backend-generator-config.sh}
 
 if [[ "$namespace" != dev || "$backend_namespace" != dev ]]; then
   echo "dev cutover only supports the dev namespace" >&2
@@ -109,11 +110,11 @@ BOOTSTRAP_URL=http://127.0.0.1:15000 \
   WORKSPACE_URL=http://127.0.0.1:15001 \
   deploy/smoke-workspace-lifecycle.sh dev
 
-backend_patch=$(jq -n \
-  --arg bootstrap "http://jcode-bootstrap-svc.dev.svc.cluster.local:5000" \
-  --arg workspace "http://jcode-generator-svc.dev.svc.cluster.local:5000" \
-  '{data:{GENERATOR_BOOTSTRAP_URL:$bootstrap,GENERATOR_WORKSPACE_URL:$workspace}}')
-kubectl patch configmap "$backend_configmap" -n "$backend_namespace" --type=merge --patch "$backend_patch"
+BACKEND_NAMESPACE="$backend_namespace" \
+  BACKEND_CONFIGMAP="$backend_configmap" \
+  GENERATOR_BOOTSTRAP_URL=http://jcode-bootstrap-svc:5000 \
+  GENERATOR_WORKSPACE_URL=http://jcode-generator-svc:5000 \
+  "$backend_config_script"
 kubectl rollout restart "deployment/$backend_deployment" -n "$backend_namespace"
 kubectl rollout status "deployment/$backend_deployment" -n "$backend_namespace" --timeout=5m
 

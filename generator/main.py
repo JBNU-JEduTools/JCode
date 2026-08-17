@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import re
@@ -121,6 +122,12 @@ def get_workspace_tolerations() -> Optional[list[client.V1Toleration]]:
         for item in value
     ] or None
 
+
+def get_pod_dns_config() -> client.V1PodDNSConfig:
+    return client.V1PodDNSConfig(
+        options=[client.V1PodDNSConfigOption(name="ndots", value="2")]
+    )
+
 # 요청 바디 모델 정의
 class DeployRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -162,6 +169,40 @@ class SmokeWorkspaceRequest(BaseModel):
 def parse_csv_env(name: str) -> list[str]:
     value = os.getenv(name, "")
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_workspace_dns_cidrs() -> list[str]:
+    configured = parse_csv_env("WORKSPACE_DNS_CIDRS")
+    if not configured:
+        raise RuntimeError("WORKSPACE_DNS_CIDRS를 하나 이상의 CIDR로 설정해야 합니다.")
+
+    cidrs = []
+    for value in configured:
+        if "/" not in value:
+            raise RuntimeError(f"WORKSPACE_DNS_CIDRS에 잘못된 CIDR이 있습니다: {value}")
+        try:
+            cidrs.append(str(ipaddress.ip_network(value, strict=True)))
+        except ValueError as exc:
+            raise RuntimeError(f"WORKSPACE_DNS_CIDRS에 잘못된 CIDR이 있습니다: {value}") from exc
+    return list(dict.fromkeys(cidrs))
+
+
+def build_workspace_dns_peers() -> list[client.V1NetworkPolicyPeer]:
+    peers = [
+        client.V1NetworkPolicyPeer(
+            namespace_selector=client.V1LabelSelector(
+                match_labels={"kubernetes.io/metadata.name": "kube-system"}
+            ),
+            pod_selector=client.V1LabelSelector(
+                match_labels={"k8s-app": "kube-dns"}
+            ),
+        )
+    ]
+    peers.extend(
+        client.V1NetworkPolicyPeer(ip_block=client.V1IPBlock(cidr=cidr))
+        for cidr in get_workspace_dns_cidrs()
+    )
+    return peers
 
 
 def get_image_pull_secret_names() -> list[str]:
@@ -441,6 +482,7 @@ def validate_runtime_configuration():
         missing = [name for name, value in required.items() if not str(value).strip()]
         if missing:
             raise RuntimeError(f"Bootstrap 필수 환경값이 누락되었습니다: {', '.join(missing)}")
+        get_workspace_dns_cidrs()
         get_image_pull_secret_remote_names()
 
 
@@ -726,6 +768,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                 spec=client.V1PodSpec(
                     service_account_name=SERVICE_ACCOUNT,
                     automount_service_account_token=False,
+                    dns_config=get_pod_dns_config(),
                     node_selector=get_workspace_node_selector(),
                     tolerations=get_workspace_tolerations(),
                     security_context=client.V1PodSecurityContext(
@@ -1285,16 +1328,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, cus
             ),
             egress=[
                 client.V1NetworkPolicyEgressRule(
-                    to=[
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": "kube-system"}
-                            ),
-                            pod_selector=client.V1LabelSelector(
-                                match_labels={"k8s-app": "kube-dns"}
-                            ),
-                        )
-                    ],
+                    to=build_workspace_dns_peers(),
                     ports=[
                         client.V1NetworkPolicyPort(port=53, protocol="UDP"),
                         client.V1NetworkPolicyPort(port=53, protocol="TCP"),
