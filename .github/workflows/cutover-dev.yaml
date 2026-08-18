@@ -20,6 +20,8 @@ jobs:
   cutover:
     runs-on: ubuntu-22.04
     environment: dev
+    env:
+      HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY || 'harbor.jedutools.io' }}
     steps:
       - name: Validate dev release
         uses: actions/github-script@v7
@@ -78,7 +80,7 @@ jobs:
       - name: Login to Harbor
         uses: docker/login-action@v3
         with:
-          registry: harbor.jbnu.ac.kr
+          registry: ${{ env.HARBOR_REGISTRY }}
           username: ${{ secrets.HARBOR_USERNAME }}
           password: ${{ secrets.HARBOR_PASSWORD }}
       - uses: azure/setup-kubectl@v4

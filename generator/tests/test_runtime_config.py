@@ -1,22 +1,6 @@
-import importlib
 import os
-import sys
-from pathlib import Path
 
 import pytest
-from kubernetes import config
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-
-@pytest.fixture()
-def generator(monkeypatch):
-    monkeypatch.setenv("GENERATOR_SERVICE_SECRET", "0123456789abcdef0123456789abcdef")
-    monkeypatch.setenv("CONTROLLER_MODE", "workspace")
-    monkeypatch.setenv("WORKSPACE_ROOT", "/home/coder/project")
-    monkeypatch.setattr(config, "load_incluster_config", lambda: None)
-    module = importlib.import_module("main")
-    return importlib.reload(module)
 
 
 def test_image_pull_secret_names_support_legacy_and_csv(generator, monkeypatch):
@@ -47,14 +31,28 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
 
 def test_workspace_images_must_use_immutable_harbor_reference(generator, monkeypatch):
     monkeypatch.setenv("WORKSPACE_INIT_IMAGE", "busybox:latest")
-    with pytest.raises(RuntimeError, match="harbor.jbnu.ac.kr"):
+    with pytest.raises(RuntimeError, match="harbor.jedutools.io"):
         generator.get_workspace_init_image()
 
     monkeypatch.setenv(
         "WORKSPACE_INIT_IMAGE",
-        "harbor.jbnu.ac.kr/jdevops/workspace-init@sha256:" + "a" * 64,
+        "harbor.jedutools.io/jdevops/workspace-init@sha256:" + "a" * 64,
     )
-    assert generator.get_workspace_init_image().startswith("harbor.jbnu.ac.kr/")
+    assert generator.get_workspace_init_image().startswith("harbor.jedutools.io/")
+
+
+def test_workspace_images_follow_configured_harbor_registry(generator, monkeypatch):
+    monkeypatch.setenv("HARBOR_REGISTRY", "registry.internal:5443")
+    monkeypatch.setenv(
+        "WORKSPACE_INIT_IMAGE",
+        "registry.internal:5443/jdevops/workspace-init@sha256:" + "b" * 64,
+    )
+
+    assert generator.get_workspace_init_image().startswith("registry.internal:5443/")
+
+    monkeypatch.setenv("HARBOR_REGISTRY", "https://registry.internal")
+    with pytest.raises(RuntimeError, match="HARBOR_REGISTRY"):
+        generator.get_workspace_init_image()
 
 
 def test_workspace_root_rejects_prefix_collision(generator, monkeypatch):

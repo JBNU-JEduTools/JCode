@@ -31,8 +31,9 @@ dev overlay는 기존 `jcode-generator-dev-*`, `jcode-router-dev-*` ConfigMap과
 1. Harbor에서 배포할 commit SHA와 이미지 digest를 확인합니다.
 
    ```bash
+   export HARBOR_REGISTRY=${HARBOR_REGISTRY:-harbor.jedutools.io}
    export COMMIT_SHA=<배포할-commit-sha>
-   docker buildx imagetools inspect "harbor.jbnu.ac.kr/jdevops/jcode-generator:$COMMIT_SHA"
+   docker buildx imagetools inspect "$HARBOR_REGISTRY/jdevops/jcode-generator:$COMMIT_SHA"
    ```
 
    같은 방법으로 `jcode-router`, `code-server`, `code-server-vnc`, `workspace-init`, `squid-exporter`, Watcher 3개 이미지, Backend, Frontend를 확인합니다.
@@ -91,12 +92,12 @@ dev overlay는 기존 `jcode-generator-dev-*`, `jcode-router-dev-*` ConfigMap과
    deploy/deploy.sh "$TARGET_ENV"
 
    kubectl set image "deployment/$BACKEND_DEPLOYMENT" \
-     "$BACKEND_CONTAINER=harbor.jbnu.ac.kr/jdevops/jcode-backend@$BACKEND_DIGEST" \
+     "$BACKEND_CONTAINER=$HARBOR_REGISTRY/jdevops/jcode-backend@$BACKEND_DIGEST" \
      -n "$BACKEND_NAMESPACE"
    kubectl rollout status "deployment/$BACKEND_DEPLOYMENT" -n "$BACKEND_NAMESPACE" --timeout=5m
 
    kubectl set image "deployment/$FRONTEND_DEPLOYMENT" \
-     "$FRONTEND_CONTAINER=harbor.jbnu.ac.kr/jdevops/jcode-front@$FRONTEND_DIGEST" \
+     "$FRONTEND_CONTAINER=$HARBOR_REGISTRY/jdevops/jcode-front@$FRONTEND_DIGEST" \
      -n "$FRONTEND_NAMESPACE"
    kubectl rollout status "deployment/$FRONTEND_DEPLOYMENT" -n "$FRONTEND_NAMESPACE" --timeout=5m
    ```

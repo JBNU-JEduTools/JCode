@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  REGISTRY: harbor.jbnu.ac.kr
+  REGISTRY: ${{ vars.HARBOR_REGISTRY || 'harbor.jedutools.io' }}
   PROJECT: jdevops
 
 jobs:

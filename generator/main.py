@@ -1,10 +1,15 @@
 import ipaddress
+import errno
+import hashlib
 import json
 import os
 import re
 import shlex
 import stat
+import shutil
+import tempfile
 import time
+import zipfile
 import logging
 import requests
 from pathlib import Path
@@ -69,6 +74,7 @@ WORKSPACE_PROXY_URL = os.getenv("WORKSPACE_PROXY_URL", "").strip()
 WORKSPACE_PROXY_NAMESPACE = os.getenv("WORKSPACE_PROXY_NAMESPACE", "").strip()
 WORKSPACE_PROXY_POD_LABEL = os.getenv("WORKSPACE_PROXY_POD_LABEL", "").strip()
 WORKSPACE_PROXY_PORT = int(os.getenv("WORKSPACE_PROXY_PORT", "3000"))
+DEFAULT_HARBOR_REGISTRY = "harbor.jedutools.io"
 WORKSPACE_NO_PROXY = os.getenv(
     "WORKSPACE_NO_PROXY",
     "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local",
@@ -138,6 +144,13 @@ class DeployRequest(BaseModel):
     file_path: str
     student_num: str
     use_vnc: bool
+    environment_profile: str = "ALGORITHM"
+    use_jupyter: bool = False
+    base_image: Optional[str] = None
+    resource_profile: str = "STANDARD"
+    egress_policy: str = "PACKAGE_PROXY"
+    workspace_scope: str = "COURSE"
+    assignment_workspace_key: Optional[str] = None
     use_snapshot: bool
     hw_count: int = Field(default=10, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
@@ -153,11 +166,64 @@ class NamespaceRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     use_vnc: bool = False
+    environment_profile: str = "ALGORITHM"
+    use_jupyter: bool = False
+    base_image: Optional[str] = None
+    resource_profile: str = "STANDARD"
+    egress_policy: str = "PACKAGE_PROXY"
+    workspace_scope: str = "COURSE"
 
 class ProvisionRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     dir_name: str
+
+class AssignmentProvisionRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    namespace: str
+    workspace_key: str
+    legacy_dir_name: Optional[str] = None
+
+class StarterDistributeRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    namespace: str
+    workspace_key: str
+    artifact_key: str
+    checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    overwrite_policy: str
+
+class AssignmentArchiveRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    namespace: str
+    workspace_key: str
+    retention_days: int = Field(default=90, ge=1, le=3650)
+    starter_artifact_key: Optional[str] = None
+    starter_checksum: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    starter_overwrite_policy: str = "PRESERVE_EXISTING"
+    deployments: list[str] = Field(default=[])
+    services: list[str] = Field(default=[])
+
+class StudentArtifactRef(BaseModel):
+    workspace_key: str
+    artifact_key: str
+    checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    overwrite_policy: str = "PRESERVE_EXISTING"
+
+class StudentProvisionRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    namespace: str
+    student_num: str
+    workspace_keys: list[str] = Field(default=[])
+    artifacts: list[StudentArtifactRef] = Field(default=[])
+
+class StudentArchiveRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    namespace: str
+    student_num: str
+    deployments: list[str] = Field(default=[])
+    services: list[str] = Field(default=[])
+    retention_days: int = Field(default=90, ge=1, le=3650)
+    archive_key: str
 
 class SmokeWorkspaceRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -303,10 +369,22 @@ def get_code_server_extra_env(use_vnc: bool) -> list[client.V1EnvVar]:
 
 def get_immutable_harbor_image(name: str) -> str:
     image = os.getenv(name, "").strip()
+    return validate_immutable_harbor_image(name, image)
+
+
+def get_harbor_registry() -> str:
+    registry = os.getenv("HARBOR_REGISTRY", DEFAULT_HARBOR_REGISTRY).strip().lower().rstrip("/")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[1-9][0-9]{0,4})?", registry):
+        raise RuntimeError("HARBOR_REGISTRY는 scheme과 경로 없는 registry host여야 합니다.")
+    return registry
+
+
+def validate_immutable_harbor_image(name: str, image: str) -> str:
     if not image:
         raise RuntimeError(f"{name}를 Harbor 이미지로 설정해야 합니다.")
-    if not image.startswith("harbor.jbnu.ac.kr/"):
-        raise RuntimeError(f"{name}는 harbor.jbnu.ac.kr 이미지여야 합니다: {image}")
+    registry = get_harbor_registry()
+    if not image.startswith(f"{registry}/"):
+        raise RuntimeError(f"{name}는 {registry} 이미지여야 합니다: {image}")
     mutable_tag = image.endswith((":latest", ":test", ":v2", ":v2-test"))
     digest_pinned = bool(re.search(r"@sha256:[0-9a-f]{64}$", image))
     commit_tagged = bool(re.search(r":[^/@]*[0-9a-f]{7,40}(?:[-._][^/]*)?$", image))
@@ -320,6 +398,55 @@ def get_code_server_image(use_vnc: bool) -> str:
     return get_immutable_harbor_image(name)
 
 
+def get_requested_workspace_image(use_vnc: bool, environment_profile: str, base_image: Optional[str]) -> str:
+    if environment_profile == "CUSTOM":
+        if not base_image:
+            raise HTTPException(status_code=400, detail="CUSTOM 환경은 base_image가 필요합니다.")
+        return validate_immutable_harbor_image("base_image", base_image)
+    return get_code_server_image(use_vnc)
+
+
+def validate_workspace_profile(
+    environment_profile: str,
+    use_vnc: bool,
+    use_jupyter: bool,
+    base_image: Optional[str],
+    resource_profile: str,
+    egress_policy: str,
+    workspace_scope: str,
+) -> None:
+    if environment_profile not in {"ALGORITHM", "LAB", "CUSTOM"}:
+        raise HTTPException(status_code=400, detail="environment_profile이 올바르지 않습니다.")
+    if resource_profile not in {"STANDARD", "HIGH_MEMORY", "GPU"}:
+        raise HTTPException(status_code=400, detail="resource_profile이 올바르지 않습니다.")
+    if egress_policy not in {"RESTRICTED", "PACKAGE_PROXY"}:
+        raise HTTPException(status_code=400, detail="egress_policy가 올바르지 않습니다.")
+    if workspace_scope not in {"COURSE", "ASSIGNMENT"}:
+        raise HTTPException(status_code=400, detail="workspace_scope가 올바르지 않습니다.")
+    if environment_profile == "ALGORITHM" and (use_vnc or use_jupyter or base_image or resource_profile != "STANDARD"):
+        raise HTTPException(status_code=409, detail="ALGORITHM 환경 설정이 표준 프로필과 일치하지 않습니다.")
+    if environment_profile == "LAB" and (not use_vnc or not use_jupyter or base_image or resource_profile != "STANDARD"):
+        raise HTTPException(status_code=409, detail="LAB 환경 설정이 표준 프로필과 일치하지 않습니다.")
+    if environment_profile == "CUSTOM":
+        get_requested_workspace_image(use_vnc, environment_profile, base_image)
+
+
+def get_workspace_resources(profile: str) -> client.V1ResourceRequirements:
+    raw = os.getenv("WORKSPACE_RESOURCE_PROFILES_JSON", "").strip()
+    if not raw:
+        raise RuntimeError("WORKSPACE_RESOURCE_PROFILES_JSON을 설정해야 합니다.")
+    try:
+        configured = json.loads(raw)
+        value = configured[profile]
+        requests_value = value["requests"]
+        limits_value = value["limits"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError(f"WORKSPACE_RESOURCE_PROFILES_JSON에 {profile} 설정이 없습니다.") from error
+    if not isinstance(requests_value, dict) or not isinstance(limits_value, dict):
+        raise RuntimeError(f"{profile} resource requests/limits는 JSON object여야 합니다.")
+    return client.V1ResourceRequirements(requests=requests_value, limits=limits_value)
+
+
 def get_workspace_init_image() -> str:
     return get_immutable_harbor_image("WORKSPACE_INIT_IMAGE")
 
@@ -328,8 +455,8 @@ def validate_workspace_dir_name(dir_name: str) -> str:
     cleaned = dir_name.strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail="dir_name은 비어 있을 수 없습니다.")
-    if len(cleaned) > 80:
-        raise HTTPException(status_code=400, detail="dir_name은 80자를 초과할 수 없습니다.")
+    if len(cleaned) > 100:
+        raise HTTPException(status_code=400, detail="dir_name은 100자를 초과할 수 없습니다.")
     if os.path.isabs(cleaned) or "/" in cleaned or "\\" in cleaned:
         raise HTTPException(status_code=400, detail="dir_name에는 경로 구분자를 사용할 수 없습니다.")
     if cleaned in {".", ".."} or any(part == ".." for part in cleaned.split(os.path.sep)):
@@ -344,6 +471,141 @@ def get_nfs_workspace_path() -> Path:
     if not mount_path.is_absolute():
         raise RuntimeError("NFS_MOUNT_PATH는 절대 경로여야 합니다.")
     return mount_path / "workspace"
+
+
+def get_starter_artifact_root() -> Path:
+    root = Path(os.getenv("STARTER_ARTIFACT_ROOT", "/starter-data").strip())
+    if not root.is_absolute():
+        raise RuntimeError("STARTER_ARTIFACT_ROOT는 절대 경로여야 합니다.")
+    return root
+
+
+def get_workspace_archive_root() -> Path:
+    root = Path(os.getenv("WORKSPACE_ARCHIVE_ROOT", "/archive-data").strip())
+    if not root.is_absolute():
+        raise RuntimeError("WORKSPACE_ARCHIVE_ROOT는 절대 경로여야 합니다.")
+    return root
+
+
+def validate_assignment_workspace_key(value: str) -> str:
+    key = value.strip()
+    if not re.fullmatch(r"assignment-[1-9][0-9]*", key):
+        raise HTTPException(status_code=400, detail="workspace_key 형식이 올바르지 않습니다.")
+    return key
+
+
+def validate_starter_artifact_key(value: str, assignment_id: int, version: int) -> str:
+    expected = f"assignments/{assignment_id}/starter/v{version}.zip"
+    if value != expected:
+        raise HTTPException(status_code=400, detail="artifact_key가 assignment/version과 일치하지 않습니다.")
+    return value
+
+
+def resolve_below(root: Path, relative: str) -> Path:
+    root = root.resolve()
+    candidate = root.joinpath(*relative.split("/")).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="저장 경로가 허용 범위를 벗어납니다.") from error
+    return candidate
+
+
+def verify_artifact_checksum(artifact: Path, expected: str) -> None:
+    actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    if actual != expected:
+        raise HTTPException(status_code=409, detail="스타터 artifact checksum이 일치하지 않습니다.")
+
+
+def iter_course_student_dirs(namespace: str) -> list[Path]:
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+    workspace_root = get_nfs_workspace_path()
+    if not workspace_root.is_dir():
+        raise HTTPException(status_code=503, detail="Workspace NFS 경로를 사용할 수 없습니다.")
+    return sorted(
+        path for path in workspace_root.glob(f"{class_div}-*")
+        if path.is_dir() and not path.is_symlink()
+    )
+
+
+def reject_symlink_path(root: Path, candidate: Path) -> None:
+    root = root.resolve()
+    current = candidate
+    while current != root:
+        if current.is_symlink():
+            raise HTTPException(status_code=409, detail=f"관리 경로에 symlink를 사용할 수 없습니다: {candidate.name}")
+        if current.parent == current:
+            raise HTTPException(status_code=400, detail="관리 경로가 허용 범위를 벗어납니다.")
+        current = current.parent
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="관리 경로가 허용 범위를 벗어납니다.") from error
+
+
+def copy_tree_preserving_existing(source: Path, target: Path) -> None:
+    reject_symlink_path(target.parent, target)
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        destination = target / relative
+        reject_symlink_path(target, destination)
+        if item.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        elif not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, destination)
+
+
+def apply_starter_artifact(artifact: Path, target: Path, overwrite_policy: str) -> None:
+    if overwrite_policy not in {"PRESERVE_EXISTING", "REPLACE_ALL"}:
+        raise HTTPException(status_code=400, detail="overwrite_policy가 올바르지 않습니다.")
+    reject_symlink_path(target.parent, target)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        extracted = Path(temp_dir)
+        with zipfile.ZipFile(artifact, "r") as archive:
+            safe_extract_zip(archive, str(extracted))
+        if overwrite_policy == "REPLACE_ALL" and target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True, exist_ok=True)
+        copy_tree_preserving_existing(extracted, target)
+    for current, directories, files in os.walk(target):
+        os.chown(current, 1000, 1000)
+        for name in directories + files:
+            os.chown(os.path.join(current, name), 1000, 1000)
+
+
+def move_directory_safely(source: Path, destination: Path, marker: Optional[dict] = None) -> None:
+    """같은 파일시스템에서는 원자적으로, 다른 PVC 사이에서는 완료 경로를 분리해 이동합니다."""
+    if source.is_symlink() or destination.is_symlink():
+        raise HTTPException(status_code=409, detail="보관 경로에 symlink를 사용할 수 없습니다.")
+    if not source.is_dir():
+        raise HTTPException(status_code=404, detail=f"이동할 경로가 없습니다: {source.name}")
+    if destination.exists():
+        raise HTTPException(status_code=409, detail=f"원본과 대상 경로가 함께 존재합니다: {source.name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        source.rename(destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        temporary = destination.with_name(f".{destination.name}.partial")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        try:
+            shutil.copytree(source, temporary, symlinks=True)
+            if marker is not None:
+                (temporary / ".retention.json").write_text(
+                    json.dumps(marker, ensure_ascii=False), encoding="utf-8"
+                )
+            os.replace(temporary, destination)
+            shutil.rmtree(source)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+    if marker is not None:
+        (destination / ".retention.json").write_text(
+            json.dumps(marker, ensure_ascii=False), encoding="utf-8"
+        )
 
 
 def get_smoke_workspace_paths(file_path: str, student_num: str) -> tuple[Path, Path]:
@@ -405,6 +667,17 @@ def validate_nfs_mount() -> None:
         raise RuntimeError(f"NFS workspace 경로에 읽기/쓰기 권한이 없습니다: {workspace_path}")
 
 
+def validate_managed_storage() -> None:
+    for name, path in {
+        "STARTER_ARTIFACT_ROOT": get_starter_artifact_root(),
+        "WORKSPACE_ARCHIVE_ROOT": get_workspace_archive_root(),
+    }.items():
+        if not path.is_dir():
+            raise RuntimeError(f"{name} 경로를 찾을 수 없습니다: {path}")
+        if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+            raise RuntimeError(f"{name} 경로에 읽기/쓰기 권한이 없습니다: {path}")
+
+
 def validate_zip_member(info, target_dir: str):
     raw_name = info.filename
     normalized = os.path.normpath(raw_name)
@@ -424,7 +697,7 @@ def validate_zip_member(info, target_dir: str):
         raise HTTPException(status_code=400, detail=f"zip 파일 경로가 대상 디렉토리를 벗어납니다: {raw_name}")
 
 
-def safe_extract_zip(zip_file, target_dir: str):
+def validate_zip_archive(zip_file, target_dir: str):
     max_files = int(os.getenv("STARTER_ZIP_MAX_FILES", "1000"))
     max_uncompressed = int(os.getenv("STARTER_ZIP_MAX_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
 
@@ -439,7 +712,11 @@ def safe_extract_zip(zip_file, target_dir: str):
         if total_size > max_uncompressed:
             raise HTTPException(status_code=400, detail="zip 파일 압축 해제 크기가 허용치를 초과합니다.")
 
-    for info in infos:
+
+def safe_extract_zip(zip_file, target_dir: str):
+    validate_zip_archive(zip_file, target_dir)
+
+    for info in zip_file.infolist():
         zip_file.extract(info, target_dir)
 
 # HTTP Bearer 인증 사용
@@ -472,7 +749,10 @@ def validate_runtime_configuration():
         get_workspace_init_image()
         build_code_server_args(False)
         build_code_server_args(True)
+        for profile in ("STANDARD", "HIGH_MEMORY", "GPU"):
+            get_workspace_resources(profile)
         validate_nfs_mount()
+        validate_managed_storage()
     if CONTROLLER_MODE == "bootstrap":
         required = {
             "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
@@ -624,7 +904,14 @@ load_incluster_config_or_fail()
 
 # # ---------------------------------
 
-def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0, assignment_dirs: list = None) -> str:
+def create_deployment(
+    apps_v1_api, namespace: str, deployment_name: str, app_label: str,
+    file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool,
+    hw_count: int = 10, prac_count: int = 0, assignment_dirs: list = None,
+    environment_profile: str = "ALGORITHM", use_jupyter: bool = False,
+    base_image: Optional[str] = None, resource_profile: str = "STANDARD",
+    workspace_scope: str = "COURSE", assignment_workspace_key: Optional[str] = None,
+) -> str:
     init_volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
@@ -671,7 +958,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
     ]
 
     # 커스텀 fork가 들어간 불변 이미지만 허용한다.
-    image_name = get_code_server_image(use_vnc)
+    image_name = get_requested_workspace_image(use_vnc, environment_profile, base_image)
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
@@ -701,7 +988,14 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             )
         )
     else:
-        if assignment_dirs:
+        if workspace_scope == "ASSIGNMENT":
+            if not assignment_workspace_key:
+                raise HTTPException(status_code=400, detail="ASSIGNMENT 범위는 assignment_workspace_key가 필요합니다.")
+            workspace_key = validate_assignment_workspace_key(assignment_workspace_key)
+            file_path = f"{file_path.rstrip('/')}/{workspace_key}"
+        if workspace_scope == "ASSIGNMENT":
+            hw_cmd = "true"
+        elif assignment_dirs:
             safe_dirs = [validate_workspace_dir_name(d) for d in assignment_dirs]
             dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
             hw_cmd = f"mkdir -p {dirs}"
@@ -751,7 +1045,8 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
     code_server_env = [
         client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
         client.V1EnvVar(name="AUTH", value="none"),
-        client.V1EnvVar(name="DISPLAY", value=":1")  # VNC Display 설정
+        client.V1EnvVar(name="DISPLAY", value=":1"),  # VNC Display 설정
+        client.V1EnvVar(name="JUPYTER_ENABLED", value=str(use_jupyter).lower()),
     ] + get_code_server_extra_env(use_vnc) + get_workspace_proxy_env()
 
     deployment = client.V1Deployment(
@@ -792,10 +1087,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                             args=code_server_args,
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
                             env=code_server_env,
-                            resources=client.V1ResourceRequirements(
-                                requests={"cpu": "200m", "memory": "256Mi"},
-                                limits={"cpu": "4", "memory": "2Gi"}
-                            ),
+                            resources=get_workspace_resources(resource_profile),
                             volume_mounts=volume_mounts,  # 동적으로 만든 volume_mounts 리스트 적용
                             security_context=client.V1SecurityContext(
                                 run_as_user=1000,
@@ -1174,7 +1466,11 @@ def build_workspace_role_binding(namespace: str) -> client.V1RoleBinding:
         ),
     )
 
-def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api, namespace: str, course_id: int, use_vnc: bool = False):
+def init_namespace(
+    core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api,
+    namespace: str, course_id: int, use_vnc: bool = False,
+    egress_policy: str = "PACKAGE_PROXY",
+):
     """고정된 namespace metadata와 runtime 권한으로 강의 공간을 초기화합니다."""
 
     # 1. Namespace
@@ -1317,6 +1613,42 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, cus
 
     # Workspace pods may reach DNS and the Watcher API only. In particular they
     # cannot call the Generator service even though both live in the watcher NS.
+    workspace_egress_rules = [
+        client.V1NetworkPolicyEgressRule(
+            to=build_workspace_dns_peers(),
+            ports=[
+                client.V1NetworkPolicyPort(port=53, protocol="UDP"),
+                client.V1NetworkPolicyPort(port=53, protocol="TCP"),
+            ],
+        ),
+        client.V1NetworkPolicyEgressRule(
+            to=[
+                client.V1NetworkPolicyPeer(
+                    namespace_selector=client.V1LabelSelector(
+                        match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
+                    ),
+                    pod_selector=client.V1LabelSelector(match_labels={"app": "watcher-backend"}),
+                )
+            ],
+            ports=[client.V1NetworkPolicyPort(port=3000, protocol="TCP")],
+        ),
+    ]
+    if egress_policy == "PACKAGE_PROXY":
+        workspace_egress_rules.append(
+            client.V1NetworkPolicyEgressRule(
+                to=[
+                    client.V1NetworkPolicyPeer(
+                        namespace_selector=client.V1LabelSelector(
+                            match_labels={"kubernetes.io/metadata.name": WORKSPACE_PROXY_NAMESPACE}
+                        ),
+                        pod_selector=client.V1LabelSelector(
+                            match_labels={"app": WORKSPACE_PROXY_POD_LABEL}
+                        ),
+                    )
+                ],
+                ports=[client.V1NetworkPolicyPort(port=WORKSPACE_PROXY_PORT, protocol="TCP")],
+            )
+        )
     workspace_egress = client.V1NetworkPolicy(
         metadata=client.V1ObjectMeta(
             name="workspace-egress",
@@ -1326,41 +1658,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, cus
             pod_selector=client.V1LabelSelector(
                 match_labels={"jcode/component": "workspace"}
             ),
-            egress=[
-                client.V1NetworkPolicyEgressRule(
-                    to=build_workspace_dns_peers(),
-                    ports=[
-                        client.V1NetworkPolicyPort(port=53, protocol="UDP"),
-                        client.V1NetworkPolicyPort(port=53, protocol="TCP"),
-                    ],
-                ),
-                client.V1NetworkPolicyEgressRule(
-                    to=[
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
-                            ),
-                            pod_selector=client.V1LabelSelector(
-                                match_labels={"app": "watcher-backend"}
-                            ),
-                        )
-                    ],
-                    ports=[client.V1NetworkPolicyPort(port=3000, protocol="TCP")],
-                ),
-                client.V1NetworkPolicyEgressRule(
-                    to=[
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": WORKSPACE_PROXY_NAMESPACE}
-                            ),
-                            pod_selector=client.V1LabelSelector(
-                                match_labels={"app": WORKSPACE_PROXY_POD_LABEL}
-                            ),
-                        )
-                    ],
-                    ports=[client.V1NetworkPolicyPort(port=WORKSPACE_PROXY_PORT, protocol="TCP")],
-                ),
-            ],
+            egress=workspace_egress_rules,
             policy_types=["Egress"],
         ),
     )
@@ -1431,6 +1729,15 @@ async def create_namespace_api(
     custom_objects_api = client.CustomObjectsApi()
 
     try:
+        validate_workspace_profile(
+            request.environment_profile,
+            request.use_vnc,
+            request.use_jupyter,
+            request.base_image,
+            request.resource_profile,
+            request.egress_policy,
+            request.workspace_scope,
+        )
         init_namespace(
             core_v1_api,
             apps_v1_api,
@@ -1440,6 +1747,7 @@ async def create_namespace_api(
             namespace,
             request.course_id,
             request.use_vnc,
+            request.egress_policy,
         )
         return {"msg": f"Namespace '{namespace}' 초기화 완료", "namespace": namespace}
     except HTTPException:
@@ -1447,6 +1755,25 @@ async def create_namespace_api(
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/namespace/{ns}")
+async def get_namespace_status(
+    ns: str,
+    course_id: int,
+    token_payload: dict = Depends(require_service_scope("namespace:read", "bootstrap")),
+):
+    """Backfill 전에 Namespace 존재 여부와 강의 소유권을 확인합니다."""
+    namespace = resolve_namespace(ns)
+    core_v1_api = client.CoreV1Api()
+    try:
+        core_v1_api.read_namespace(name=namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"exists": False, "namespace": namespace}
+        raise
+    verify_course_namespace(core_v1_api, namespace, course_id)
+    return {"exists": True, "namespace": namespace}
 
 
 def wait_for_namespace_deleted(
@@ -1547,6 +1874,15 @@ async def deploy_resources(
     # Workspace Controller는 이미 bootstrap된 Namespace의 소유 메타데이터와
     # 런타임 ConfigMap만 확인한다. Cluster-scoped 리소스는 만지지 않는다.
     try:
+        validate_workspace_profile(
+            request.environment_profile,
+            request.use_vnc,
+            request.use_jupyter,
+            request.base_image,
+            request.resource_profile,
+            request.egress_policy,
+            request.workspace_scope,
+        )
         verify_course_namespace(core_v1_api, namespace, request.course_id)
         ensure_code_server_config(core_v1_api, namespace)
         if request.use_vnc:
@@ -1569,7 +1905,13 @@ async def deploy_resources(
             request.use_snapshot,
             request.hw_count,
             request.prac_count,
-            request.assignment_dirs
+            request.assignment_dirs,
+            request.environment_profile,
+            request.use_jupyter,
+            request.base_image,
+            request.resource_profile,
+            request.workspace_scope,
+            request.assignment_workspace_key,
         )
         service_msg = create_service(
             core_v1_api,
@@ -1657,6 +1999,316 @@ async def provision_workspace(
 
     logger.info(f"Provisioned '{dir_name}' in {created} student directories for {class_div}")
     return {"created": created, "dir_name": dir_name}
+
+
+@app.post("/api/workspace/assignments/provision")
+async def provision_assignment_workspace(
+    request: AssignmentProvisionRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    """불변 assignment key를 모든 기존 학생 공간에 멱등하게 준비합니다."""
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    workspace_key = validate_assignment_workspace_key(request.workspace_key)
+    legacy = validate_workspace_dir_name(request.legacy_dir_name) if request.legacy_dir_name else None
+    migrated = 0
+    created = 0
+    for student_dir in iter_course_student_dirs(namespace):
+        target = student_dir / workspace_key
+        source = student_dir / legacy if legacy and legacy != workspace_key else None
+        reject_symlink_path(student_dir, target)
+        if source is not None:
+            reject_symlink_path(student_dir, source)
+        if target.exists():
+            if source and source.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"기존 경로와 새 경로가 함께 존재합니다: {student_dir.name}",
+                )
+            continue
+        if source and source.exists():
+            source.rename(target)
+            migrated += 1
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            created += 1
+        os.chown(target, 1000, 1000)
+    return {"workspace_key": workspace_key, "migrated": migrated, "created": created}
+
+
+@app.post("/api/workspace/assignments/starter/upload")
+async def upload_starter_artifact(
+    course_id: int = Form(...),
+    namespace: str = Form(...),
+    assignment_id: int = Form(...),
+    version: int = Form(...),
+    artifact_key: str = Form(...),
+    file: UploadFile = File(...),
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    """스타터 ZIP 원본을 학생 공간과 분리된 보관소에 저장합니다."""
+    namespace = resolve_namespace(namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, course_id)
+    if assignment_id <= 0 or version <= 0:
+        raise HTTPException(status_code=400, detail="assignment_id와 version은 양수여야 합니다.")
+    key = validate_starter_artifact_key(artifact_key, assignment_id, version)
+    root = get_starter_artifact_root()
+    root.mkdir(parents=True, exist_ok=True)
+    target = resolve_below(root, key)
+    content = await file.read()
+    max_bytes = int(os.getenv("STARTER_ZIP_MAX_BYTES", str(50 * 1024 * 1024)))
+    if not content or len(content) > max_bytes:
+        raise HTTPException(status_code=400, detail="zip 파일 크기가 허용 범위를 벗어납니다.")
+    checksum = hashlib.sha256(content).hexdigest()
+    if target.exists():
+        existing = hashlib.sha256(target.read_bytes()).hexdigest()
+        if existing != checksum:
+            raise HTTPException(status_code=409, detail="같은 artifact_key에 다른 파일이 이미 있습니다.")
+        return {"artifact_key": key, "checksum": checksum, "size_bytes": target.stat().st_size}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".upload", delete=False) as temporary:
+        temporary.write(content)
+        temporary_path = Path(temporary.name)
+    try:
+        with zipfile.ZipFile(temporary_path, "r") as archive:
+            validate_zip_archive(archive, str(target.parent))
+        os.replace(temporary_path, target)
+        os.chmod(target, 0o440)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return {"artifact_key": key, "checksum": checksum, "size_bytes": len(content)}
+
+
+@app.post("/api/workspace/assignments/starter/distribute")
+async def distribute_starter_artifact(
+    request: StarterDistributeRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    workspace_key = validate_assignment_workspace_key(request.workspace_key)
+    if not re.fullmatch(r"assignments/[1-9][0-9]*/starter/v[1-9][0-9]*\.zip", request.artifact_key):
+        raise HTTPException(status_code=400, detail="artifact_key 형식이 올바르지 않습니다.")
+    artifact = resolve_below(get_starter_artifact_root(), request.artifact_key)
+    if not artifact.is_file():
+        raise HTTPException(status_code=404, detail="스타터 artifact를 찾을 수 없습니다.")
+    verify_artifact_checksum(artifact, request.checksum)
+    deployed = 0
+    for student_dir in iter_course_student_dirs(namespace):
+        apply_starter_artifact(artifact, student_dir / workspace_key, request.overwrite_policy)
+        deployed += 1
+    return {"workspace_key": workspace_key, "deployed": deployed}
+
+
+@app.post("/api/workspace/assignments/archive")
+async def archive_assignment_workspace(
+    request: AssignmentArchiveRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    apps_api = client.AppsV1Api()
+    core_api = client.CoreV1Api()
+    for name in request.deployments:
+        delete_deployment(apps_api, namespace, name)
+    for name in request.services:
+        delete_service(core_api, namespace, name)
+    workspace_key = validate_assignment_workspace_key(request.workspace_key)
+    archive_root = get_workspace_archive_root()
+    archive_root.mkdir(parents=True, exist_ok=True)
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+    archived = 0
+    for student_dir in iter_course_student_dirs(namespace):
+        source = student_dir / workspace_key
+        final_source = resolve_below(
+            archive_root, f"final/{class_div}/{student_dir.name}/{workspace_key}"
+        )
+        if not source.exists() and final_source.exists():
+            source = final_source
+        destination = resolve_below(archive_root, f"{class_div}/{student_dir.name}/{workspace_key}")
+        if not source.exists():
+            continue
+        if destination.exists():
+            raise HTTPException(status_code=409, detail=f"보관 경로가 이미 존재합니다: {student_dir.name}")
+        move_directory_safely(
+            source,
+            destination,
+            {
+                "course_id": request.course_id,
+                "workspace_key": workspace_key,
+                "retention_days": request.retention_days,
+                "archived_at": int(time.time()),
+            },
+        )
+        archived += 1
+    return {"workspace_key": workspace_key, "archived": archived}
+
+
+def move_assignment_between_workspace_and_final_archive(
+    namespace: str,
+    workspace_key: str,
+    retention_days: int,
+    restore: bool,
+    starter_artifact: Optional[Path] = None,
+    starter_overwrite_policy: str = "PRESERVE_EXISTING",
+) -> int:
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+    archive_root = get_workspace_archive_root()
+    moved = 0
+    for student_dir in iter_course_student_dirs(namespace):
+        workspace_path = student_dir / workspace_key
+        final_path = resolve_below(archive_root, f"final/{class_div}/{student_dir.name}/{workspace_key}")
+        source, destination = (final_path, workspace_path) if restore else (workspace_path, final_path)
+        if not source.exists():
+            if destination.exists():
+                continue
+            if restore:
+                destination.mkdir(parents=True, exist_ok=True)
+                os.chown(destination, 1000, 1000)
+                if starter_artifact is not None:
+                    apply_starter_artifact(starter_artifact, destination, starter_overwrite_policy)
+                moved += 1
+            continue
+        if destination.exists():
+            raise HTTPException(status_code=409, detail=f"원본과 대상 경로가 함께 존재합니다: {student_dir.name}")
+        if restore:
+            move_directory_safely(source, destination)
+            (destination / ".retention.json").unlink(missing_ok=True)
+        else:
+            move_directory_safely(
+                source,
+                destination,
+                {
+                    "workspace_key": workspace_key,
+                    "retention_days": retention_days,
+                    "archived_at": int(time.time()),
+                },
+            )
+        moved += 1
+    return moved
+
+
+@app.post("/api/workspace/assignments/finalize")
+async def finalize_assignment_workspace(
+    request: AssignmentArchiveRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    apps_api = client.AppsV1Api()
+    core_api = client.CoreV1Api()
+    for name in request.deployments:
+        delete_deployment(apps_api, namespace, name)
+    for name in request.services:
+        delete_service(core_api, namespace, name)
+    workspace_key = validate_assignment_workspace_key(request.workspace_key)
+    moved = move_assignment_between_workspace_and_final_archive(
+        namespace, workspace_key, request.retention_days, restore=False
+    )
+    return {"finalized": True, "workspace_key": workspace_key, "moved": moved}
+
+
+@app.post("/api/workspace/assignments/restore")
+async def restore_assignment_workspace(
+    request: AssignmentArchiveRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    workspace_key = validate_assignment_workspace_key(request.workspace_key)
+    starter_artifact = None
+    if request.starter_artifact_key or request.starter_checksum:
+        if not request.starter_artifact_key or not request.starter_checksum:
+            raise HTTPException(status_code=400, detail="스타터 artifact key와 checksum을 함께 보내야 합니다.")
+        if not re.fullmatch(r"assignments/[1-9][0-9]*/starter/v[1-9][0-9]*\.zip", request.starter_artifact_key):
+            raise HTTPException(status_code=400, detail="artifact_key 형식이 올바르지 않습니다.")
+        starter_artifact = resolve_below(get_starter_artifact_root(), request.starter_artifact_key)
+        if not starter_artifact.is_file():
+            raise HTTPException(status_code=404, detail="스타터 artifact를 찾을 수 없습니다.")
+        verify_artifact_checksum(starter_artifact, request.starter_checksum)
+    moved = move_assignment_between_workspace_and_final_archive(
+        namespace,
+        workspace_key,
+        request.retention_days,
+        restore=True,
+        starter_artifact=starter_artifact,
+        starter_overwrite_policy=request.starter_overwrite_policy,
+    )
+    return {"restored": True, "workspace_key": workspace_key, "moved": moved}
+
+
+@app.post("/api/workspace/students/provision")
+async def provision_student_workspace(
+    request: StudentProvisionRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    if not re.fullmatch(r"[0-9]{1,20}", request.student_num):
+        raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+    workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+    extensions = Path(NFS_MOUNT_PATH) / "extensions" / request.student_num
+    for path in (workspace, extensions):
+        reject_symlink_path(path.parent, path)
+        path.mkdir(parents=True, exist_ok=True)
+        os.chown(path, 1000, 1000)
+    for value in request.workspace_keys:
+        assignment_path = workspace / validate_assignment_workspace_key(value)
+        reject_symlink_path(workspace, assignment_path)
+        assignment_path.mkdir(parents=True, exist_ok=True)
+        os.chown(assignment_path, 1000, 1000)
+    applied = 0
+    for artifact_ref in request.artifacts:
+        workspace_key = validate_assignment_workspace_key(artifact_ref.workspace_key)
+        if not re.fullmatch(r"assignments/[1-9][0-9]*/starter/v[1-9][0-9]*\.zip", artifact_ref.artifact_key):
+            raise HTTPException(status_code=400, detail="artifact_key 형식이 올바르지 않습니다.")
+        artifact = resolve_below(get_starter_artifact_root(), artifact_ref.artifact_key)
+        if not artifact.is_file():
+            raise HTTPException(status_code=404, detail=f"스타터 artifact를 찾을 수 없습니다: {artifact_ref.artifact_key}")
+        verify_artifact_checksum(artifact, artifact_ref.checksum)
+        apply_starter_artifact(artifact, workspace / workspace_key, artifact_ref.overwrite_policy)
+        applied += 1
+    return {"ready": True, "workspace": workspace.name, "starter_artifacts": applied}
+
+
+@app.post("/api/workspace/students/archive")
+async def archive_student_workspace(
+    request: StudentArchiveRequest,
+    token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+):
+    namespace = resolve_namespace(request.namespace)
+    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    if not re.fullmatch(r"[0-9]{1,20}", request.student_num):
+        raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
+    if not re.fullmatch(r"[0-9a-f-]{36}", request.archive_key):
+        raise HTTPException(status_code=400, detail="archive_key 형식이 올바르지 않습니다.")
+    apps_api = client.AppsV1Api()
+    core_api = client.CoreV1Api()
+    for name in request.deployments:
+        delete_deployment(apps_api, namespace, name)
+    for name in request.services:
+        delete_service(core_api, namespace, name)
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+    source = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+    destination = resolve_below(
+        get_workspace_archive_root(),
+        f"memberships/{class_div}/{request.student_num}/{request.archive_key}",
+    )
+    if source.exists() and destination.exists():
+        raise HTTPException(status_code=409, detail="학생 Workspace 원본과 보관본이 함께 존재합니다.")
+    if source.exists():
+        move_directory_safely(
+            source,
+            destination,
+            {
+                "course_id": request.course_id,
+                "student_num": request.student_num,
+                "retention_days": request.retention_days,
+                "archived_at": int(time.time()),
+            },
+        )
+    return {"archived": True, "archive_key": request.archive_key}
 
 
 @app.post("/api/workspace/smoke")

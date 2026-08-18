@@ -5,6 +5,7 @@ resources:
   - workspace-controller.yaml
   - router.yaml
   - squid-exporter.yaml
+  - archive-cleanup.yaml
 labels:
   - pairs:
       app.kubernetes.io/part-of: jcode

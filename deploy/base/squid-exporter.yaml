@@ -24,7 +24,7 @@ spec:
       - name: watcher-harbor-registry-secret
       containers:
       - name: squid-exporter
-        image: harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA
+        image: harbor.jedutools.io/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA
         env:
           - name: SQUID_EXPORTER_LISTEN
             value: ":9308"

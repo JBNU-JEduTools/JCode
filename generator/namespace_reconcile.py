@@ -12,6 +12,8 @@ from urllib.parse import unquote, urlparse
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+INFORMATIONAL_FINDINGS = frozenset({"quarantined_namespace"})
+
 
 @dataclass(frozen=True)
 class Course:
@@ -219,6 +221,13 @@ def reconcile(
     return result
 
 
+def summarize_findings(result: dict) -> tuple[int, dict, dict]:
+    findings = {key: value for key, value in result.items() if key not in INFORMATIONAL_FINDINGS}
+    information = {key: result.get(key, []) for key in INFORMATIONAL_FINDINGS}
+    drift_count = sum(len(items) for items in findings.values())
+    return drift_count, findings, information
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="JCode namespace 상태를 변경 없이 비교합니다.")
     source = parser.add_mutually_exclusive_group()
@@ -250,8 +259,13 @@ def main() -> int:
         args.controller_namespace,
         args.environment,
     )
-    drift_count = sum(len(items) for items in result.values())
-    print(json.dumps({"dry_run": True, "drift_count": drift_count, "findings": result}, ensure_ascii=False, indent=2))
+    drift_count, findings, information = summarize_findings(result)
+    print(json.dumps({
+        "dry_run": True,
+        "drift_count": drift_count,
+        "findings": findings,
+        "information": information,
+    }, ensure_ascii=False, indent=2))
     return 2 if args.fail_on_drift and drift_count else 0
 
 

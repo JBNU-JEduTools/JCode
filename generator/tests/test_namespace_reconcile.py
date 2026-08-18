@@ -1,9 +1,11 @@
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from namespace_reconcile import Course, reconcile
+import namespace_reconcile
+from namespace_reconcile import Course, reconcile, summarize_findings
 
 
 def healthy_inventory(course_id="11"):
@@ -72,6 +74,31 @@ def test_reconcile_reports_quarantined_legacy_namespace_separately():
 
     assert findings["quarantined_namespace"] == [{"namespace": "jcode-os-1"}]
     assert findings["orphan"] == []
+
+    drift_count, drift, information = summarize_findings(findings)
+    assert drift_count == 0
+    assert "quarantined_namespace" not in drift
+    assert information == {"quarantined_namespace": [{"namespace": "jcode-os-1"}]}
+
+
+def test_fail_on_drift_ignores_quarantined_namespace(monkeypatch, capsys):
+    inventory = healthy_inventory()
+    inventory["jcode-os-1"]["migration_state"] = "quarantined"
+    monkeypatch.setattr(sys, "argv", [
+        "namespace_reconcile.py",
+        "--courses-file", "courses.json",
+        "--environment", "dev",
+        "--controller-namespace", "dev",
+        "--fail-on-drift",
+    ])
+    monkeypatch.setattr(namespace_reconcile, "load_courses_from_file", lambda _: [])
+    monkeypatch.setattr(namespace_reconcile, "load_kubernetes_config", lambda: None)
+    monkeypatch.setattr(namespace_reconcile, "collect_cluster_inventory", lambda *_: inventory)
+
+    assert namespace_reconcile.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["drift_count"] == 0
+    assert output["information"]["quarantined_namespace"] == [{"namespace": "jcode-os-1"}]
 
 
 def test_reconcile_classifies_namespace_drift():

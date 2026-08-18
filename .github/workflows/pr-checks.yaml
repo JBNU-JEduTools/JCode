@@ -24,6 +24,7 @@ jobs:
           cache-dependency-path: image/squid-exporter/go.mod
       - run: python -m pip install -r generator/requirements.txt pytest
       - run: python -m pytest -q generator/tests
+      - run: python -m py_compile generator/main.py generator/archive_reconcile.py
       - run: go test ./...
         working-directory: image/squid-exporter
       - run: docker build -t jcode-squid-exporter:pr image/squid-exporter
@@ -73,12 +74,19 @@ jobs:
           grep -q 'name: NFS_MOUNT_PATH' deploy/base/workspace-controller.yaml
           grep -q 'mountPath: /nfs-data' deploy/base/workspace-controller.yaml
           grep -q 'claimName: jcode-vol-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'claimName: jcode-starter-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'claimName: jcode-archive-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'WORKSPACE_RESOURCE_PROFILES_JSON' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'name: jcode-archive-cleanup' deploy/base/archive-cleanup.yaml
+          grep -q 'verify_cronjob_image' deploy/verify-release-images.sh
           grep -q 'WATCHER_API_BASE' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'WORKSPACE_DNS_CIDRS' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'WORKSPACE_DNS_CIDRS' deploy/deploy.sh
           grep -q 'reconcile_workspace_dns.py' deploy/deploy.sh
           grep -q 'watcher-backend-service.dev.svc.cluster.local:3000' deploy/deploy.sh
           grep -q 'watcher-backend-service.watcher.svc.cluster.local:3000' deploy/deploy.sh
+          grep -Fq 'workspace_proxy_url="http://jcode-router-svc.${namespace}.svc.cluster.local:3000"' deploy/deploy.sh
+          grep -q 'WORKSPACE_PROXY_URL:\$workspace_proxy_url' deploy/deploy.sh
           grep -Fq "ALLOWED_NETWORK_CIDR=\"\$allowed_network_cidr\"" deploy/deploy.sh
           grep -q 'router/k8s/configure-squid.sh' deploy/deploy.sh
           grep -q 'acl cache_manager urlpath_regex' router/k8s/configure-squid.sh
@@ -87,7 +95,10 @@ jobs:
           if grep -R -nE '(^|[[:space:]])image:[[:space:]]+([^/[:space:]]+/)?[^[:space:]]+:latest|image="busybox"' generator router; then exit 1; fi
           grep -q 'WORKSPACE_INIT_IMAGE' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'volumeHandle' generator/k8s/configure-workspace-storage.sh
-          grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' deploy/base/squid-exporter.yaml
+          grep -q 'harbor.jedutools.io/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' deploy/base/squid-exporter.yaml
+          grep -q 'HARBOR_REGISTRY' deploy/deploy.sh
+          if grep -R -n 'harbor\.jbnu\.ac\.kr' --exclude-dir=.git --exclude-dir=__pycache__ --exclude='*.pyc' .; then exit 1; fi
+          grep -q 'app: jcode-assignment-path-backfill' deploy/base/bootstrap-controller.yaml
           jq -e '.schema == 3 and .environment == "dev" and (.revisions | length == 5) and (.digests | length == 12)' deploy/release-manifest.example.json >/dev/null
           grep -q "const port = Number.parseInt(process.env.PORT || '3001', 10);" router/server.js
           if grep -nEi 'refresh token extracted|Access token refreshed.*token|Token Verified Successfully.*, decoded|token refresh:.*,[[:space:]]*err[[:space:]]*\)' router/server.js; then exit 1; fi

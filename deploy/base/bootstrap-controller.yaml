@@ -33,7 +33,7 @@ spec:
       - name: watcher-harbor-registry-secret
       containers:
       - name: bootstrap
-        image: harbor.jbnu.ac.kr/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+        image: harbor.jedutools.io/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
         imagePullPolicy: IfNotPresent
         envFrom:
         - configMapRef:
@@ -116,6 +116,9 @@ spec:
     - podSelector:
         matchLabels:
           app: jcode-backend
+    - podSelector:
+        matchLabels:
+          app: jcode-assignment-path-backfill
     ports:
     - protocol: TCP
       port: 5000

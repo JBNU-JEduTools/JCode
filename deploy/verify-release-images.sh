@@ -4,6 +4,11 @@ set -euo pipefail
 manifest=${1:?release manifest path is required}
 target=${2:?target must be dev or production}
 [[ -f "$manifest" ]]
+harbor_registry=${HARBOR_REGISTRY:-harbor.jedutools.io}
+[[ "$harbor_registry" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]] || {
+  echo "HARBOR_REGISTRY must be a registry host without scheme or path: $harbor_registry" >&2
+  exit 2
+}
 case "$target" in
   dev)
     jcode_namespace=dev
@@ -56,9 +61,20 @@ verify_workload() {
   done < <(jq -r --arg container "$container" '.items[].status.containerStatuses[]? | select(.name == $container) | .imageID' <<<"$pods")
 }
 
-registry=harbor.jbnu.ac.kr/jdevops
+verify_cronjob_image() {
+  local namespace=$1 name=$2 container=$3 image=$4 expected=$5 spec_image
+  spec_image=$(kubectl get cronjob "$name" -n "$namespace" -o json | jq -er --arg container "$container" \
+    '.spec.jobTemplate.spec.template.spec.containers[] | select(.name == $container) | .image')
+  [[ "$spec_image" == "$image@$expected" ]] || {
+    echo "$namespace/cronjob/$name uses $spec_image, expected $image@$expected" >&2
+    exit 1
+  }
+}
+
+registry="$harbor_registry/jdevops"
 verify_workload deployment "$jcode_namespace" jcode-bootstrap bootstrap "$registry/jcode-generator" "$(digest_for generator)"
 verify_workload deployment "$jcode_namespace" jcode-generator jcode-generator "$registry/jcode-generator" "$(digest_for generator)"
+verify_cronjob_image "$jcode_namespace" jcode-archive-cleanup cleanup "$registry/jcode-generator" "$(digest_for generator)"
 verify_workload deployment "$jcode_namespace" jcode-router jcode-router "$registry/jcode-router" "$(digest_for router)"
 verify_workload deployment "$jcode_namespace" squid-exporter squid-exporter "$registry/squid-exporter" "$(digest_for squid_exporter)"
 verify_workload deployment "$watcher_namespace" watcher-backend watcher-backend "$registry/watcher-backend" "$(digest_for watcher_backend)"

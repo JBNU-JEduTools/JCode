@@ -15,6 +15,26 @@ replicas:
     count: 1
 patches:
   - target:
+      kind: CronJob
+      name: jcode-archive-cleanup
+    patch: |-
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata:
+        name: jcode-archive-cleanup
+      spec:
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                nodeSelector:
+                  env: dev
+                tolerations:
+                  - key: dev-node
+                    operator: Equal
+                    value: "true"
+                    effect: NoSchedule
+  - target:
       kind: Deployment
     patch: |-
       apiVersion: apps/v1

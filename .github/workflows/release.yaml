@@ -48,6 +48,8 @@ jobs:
   deploy-in-order:
     runs-on: ubuntu-22.04
     environment: ${{ inputs.target }}
+    env:
+      HARBOR_REGISTRY: ${{ vars.HARBOR_REGISTRY || 'harbor.jedutools.io' }}
     steps:
       - name: Checkout develop release code
         if: inputs.target == 'dev'
@@ -244,7 +246,7 @@ jobs:
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
           for attempt in 1 2 3 4 5; do
-            if printf '%s' "$HARBOR_PASSWORD" | timeout 30 docker login harbor.jbnu.ac.kr --username "$HARBOR_USERNAME" --password-stdin; then
+            if printf '%s' "$HARBOR_PASSWORD" | timeout 30 docker login "$HARBOR_REGISTRY" --username "$HARBOR_USERNAME" --password-stdin; then
               exit 0
             fi
             sleep $((attempt * 5))
@@ -266,13 +268,13 @@ jobs:
             "jdevops|jcode-backend|${BACKEND_DIGEST}" \
             "jdevops|jcode-front|${FRONTEND_DIGEST}"; do
             IFS='|' read -r project component digest <<< "$entry"
-            docker buildx imagetools inspect "harbor.jbnu.ac.kr/${project}/${component}@${digest}"
+            docker buildx imagetools inspect "${HARBOR_REGISTRY}/${project}/${component}@${digest}"
           done
       - name: Match revisions to image digests
         run: |
           verify_revision_digest() {
             local component=$1 revision=$2 expected_digest=$3
-            local image="harbor.jbnu.ac.kr/jdevops/${component}:${revision}"
+            local image="${HARBOR_REGISTRY}/jdevops/${component}:${revision}"
             local actual_digest
             actual_digest=$(docker buildx imagetools inspect "$image" | awk '$1 == "Digest:" {print $2; exit}')
             if [[ "$actual_digest" != "$expected_digest" ]]; then
@@ -298,7 +300,7 @@ jobs:
             digest_variable=CODE_SERVER_DIGEST
             [[ "$component" == code-server-vnc ]] && digest_variable=CODE_SERVER_VNC_DIGEST
             digest=${!digest_variable}
-            image="harbor.jbnu.ac.kr/jdevops/${component}@${digest}"
+            image="${HARBOR_REGISTRY}/jdevops/${component}@${digest}"
             docker pull "$image"
             [[ $(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image") == "$CODE_SERVER_REF" ]]
             [[ $(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' "$image") == "$CODE_SERVER_BASE_DIGEST" ]]
@@ -351,7 +353,7 @@ jobs:
           : "${KUBE_NAMESPACE:?BACKEND_NAMESPACE environment variable is required}"
           : "${KUBE_DEPLOYMENT:?BACKEND_DEPLOYMENT environment variable is required}"
           : "${KUBE_CONTAINER:?BACKEND_CONTAINER environment variable is required}"
-          image="harbor.jbnu.ac.kr/jdevops/jcode-backend@${BACKEND_DIGEST}"
+          image="${HARBOR_REGISTRY}/jdevops/jcode-backend@${BACKEND_DIGEST}"
           kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
           kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
       - name: Deploy Frontend last
@@ -363,7 +365,7 @@ jobs:
           : "${KUBE_NAMESPACE:?FRONTEND_NAMESPACE environment variable is required}"
           : "${KUBE_DEPLOYMENT:?FRONTEND_DEPLOYMENT environment variable is required}"
           : "${KUBE_CONTAINER:?FRONTEND_CONTAINER environment variable is required}"
-          image="harbor.jbnu.ac.kr/jdevops/jcode-front@${FRONTEND_DIGEST}"
+          image="${HARBOR_REGISTRY}/jdevops/jcode-front@${FRONTEND_DIGEST}"
           kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
           kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
       - name: Verify production release

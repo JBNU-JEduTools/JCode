@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: jcode-archive-cleanup
+  namespace: watcher
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: watcher-harbor-registry-secret
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+            fsGroup: 1000
+            fsGroupChangePolicy: OnRootMismatch
+          containers:
+          - name: cleanup
+            image: harbor.jedutools.io/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+            imagePullPolicy: IfNotPresent
+            command: ["python", "/app/archive_reconcile.py", "--apply"]
+            env:
+            - name: WORKSPACE_ARCHIVE_ROOT
+              value: /archive-data
+            volumeMounts:
+            - name: archive-storage
+              mountPath: /archive-data
+            resources:
+              requests:
+                cpu: 25m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+          volumes:
+          - name: archive-storage
+            persistentVolumeClaim:
+              claimName: jcode-archive-pvc

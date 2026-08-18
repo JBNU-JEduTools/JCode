@@ -133,6 +133,43 @@ def test_namespace_api_preserves_conflict_for_namespace_owned_by_another_course(
     assert error.value.status_code == 409
 
 
+def test_namespace_status_returns_false_when_namespace_is_missing(generator, monkeypatch):
+    class MissingNamespace:
+        def read_namespace(self, name):
+            raise generator.ApiException(status=404)
+
+    monkeypatch.setattr(generator.client, "CoreV1Api", MissingNamespace)
+
+    result = asyncio.run(generator.get_namespace_status("jcode-os-1", 11, {}))
+
+    assert result == {"exists": False, "namespace": "jcode-os-1"}
+
+
+def test_namespace_status_verifies_course_ownership(generator, monkeypatch):
+    class ExistingNamespace:
+        def read_namespace(self, name):
+            return generator.client.V1Namespace(
+                metadata=generator.client.V1ObjectMeta(
+                    labels={"jcode.io/environment": "prod"},
+                    annotations={"jcode.io/environment": "prod"},
+                )
+            )
+
+        def read_namespaced_config_map(self, name, namespace):
+            return generator.client.V1ConfigMap(
+                data={"course-id": "11", "namespace": namespace, "environment": "prod"}
+            )
+
+    monkeypatch.setattr(generator.client, "CoreV1Api", ExistingNamespace)
+
+    result = asyncio.run(generator.get_namespace_status("jcode-os-1", 11, {}))
+    assert result == {"exists": True, "namespace": "jcode-os-1"}
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(generator.get_namespace_status("jcode-os-1", 12, {}))
+    assert error.value.status_code == 403
+
+
 def test_course_namespace_metadata_is_created_immutable(generator):
     class CoreV1:
         created = None

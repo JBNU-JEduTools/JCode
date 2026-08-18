@@ -43,11 +43,13 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       imagePullSecrets:
       - name: watcher-harbor-registry-secret
       containers:
       - name: jcode-generator
-        image: harbor.jbnu.ac.kr/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+        image: harbor.jedutools.io/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 5000
@@ -67,9 +69,17 @@ spec:
           value: "jcode-"
         - name: NFS_MOUNT_PATH
           value: "/nfs-data"
+        - name: STARTER_ARTIFACT_ROOT
+          value: "/starter-data"
+        - name: WORKSPACE_ARCHIVE_ROOT
+          value: "/archive-data"
         volumeMounts:
         - name: workspace-storage
           mountPath: /nfs-data
+        - name: starter-storage
+          mountPath: /starter-data
+        - name: archive-storage
+          mountPath: /archive-data
         readinessProbe:
           httpGet:
             path: /health/ready
@@ -99,6 +109,12 @@ spec:
       - name: workspace-storage
         persistentVolumeClaim:
           claimName: jcode-vol-pvc
+      - name: starter-storage
+        persistentVolumeClaim:
+          claimName: jcode-starter-pvc
+      - name: archive-storage
+        persistentVolumeClaim:
+          claimName: jcode-archive-pvc
 ---
 apiVersion: v1
 kind: Service
