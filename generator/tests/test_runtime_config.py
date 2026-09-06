@@ -1,4 +1,7 @@
+import asyncio
+import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,9 +27,169 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
         "/home/coder/project",
         "--auth",
         "none",
-        "--restrict-workspace-root",
-        "/home/coder/project",
+        "--extensions-dir",
+        "/home/coder/extensions",
+        "--disable-workspace-trust",
+        "--disable-telemetry",
+        "--disable-update-check",
     ]
+
+
+def test_removed_fork_workspace_flag_is_rejected(generator, monkeypatch):
+    monkeypatch.setenv(
+        "CODE_SERVER_ARGS",
+        "--restrict-workspace-root /home/coder/project /home/coder/project",
+    )
+
+    with pytest.raises(RuntimeError, match="지원하지 않습니다"):
+        generator.get_code_server_args(False)
+
+
+def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, monkeypatch):
+    class AppsV1:
+        def __init__(self):
+            self.deployment = None
+
+        def create_namespaced_deployment(self, namespace, body):
+            self.deployment = body
+
+    monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
+    monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
+    monkeypatch.setattr(generator, "get_workspace_resources", lambda *_: generator.client.V1ResourceRequirements())
+    monkeypatch.setattr(generator, "get_image_pull_secret_names", lambda: [])
+    apps = AppsV1()
+
+    generator.create_deployment(
+        apps,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001",
+        "workspace/alg-1-20260001",
+        "20260001",
+        False,
+        False,
+    )
+
+    pod_spec = apps.deployment.spec.template.spec
+    init_mounts = pod_spec.init_containers[0].volume_mounts
+    runtime = pod_spec.containers[0]
+    assert all(mount.mount_path != "/home/coder/extensions" for mount in init_mounts)
+    assert any(mount.mount_path == "/home/coder/extensions" for mount in runtime.volume_mounts)
+    extension_mount = next(mount for mount in runtime.volume_mounts if mount.mount_path == "/home/coder/extensions")
+    assert extension_mount.sub_path == "extensions-v2/20260001"
+    assert extension_mount.read_only is True
+    policy_mount = next(mount for mount in runtime.volume_mounts if mount.mount_path == "/etc/vscode/policy.json")
+    assert policy_mount.sub_path == "policy.json"
+    assert policy_mount.read_only is True
+    assert next(item.value for item in runtime.env if item.name == "EXTENSIONS_GALLERY") == "{}"
+    assert all(mount.mount_path != "/home/coder/.local" for mount in init_mounts + runtime.volume_mounts)
+    assert "/home/coder/.local" not in " ".join(pod_spec.init_containers[0].command)
+    assert "/home/coder/extensions" not in " ".join(pod_spec.init_containers[0].command)
+    init_command = " ".join(pod_spec.init_containers[0].command)
+    assert "/home/coder/project/workspace" in init_command
+    assert "/home/coder/project/hw" not in init_command
+    assert "/home/coder/project/prac" not in init_command
+    assert runtime.readiness_probe.tcp_socket.port == 8080
+    assert apps.deployment.spec.progress_deadline_seconds == 600
+
+
+def test_existing_workspace_deployment_is_reconciled(generator, monkeypatch):
+    class AppsV1:
+        def __init__(self):
+            self.patched = None
+
+        def create_namespaced_deployment(self, namespace, body):
+            raise generator.ApiException(status=409)
+
+        def patch_namespaced_deployment(self, name, namespace, body):
+            self.patched = body
+
+    monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
+    monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
+    monkeypatch.setattr(generator, "get_workspace_resources", lambda *_: generator.client.V1ResourceRequirements())
+    monkeypatch.setattr(generator, "get_image_pull_secret_names", lambda: [])
+    apps = AppsV1()
+
+    result = generator.create_deployment(
+        apps,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001",
+        "workspace/alg-1-20260001",
+        "20260001",
+        False,
+        False,
+    )
+
+    assert result == "Deployment 'jcode-alg-1-20260001' 갱신 완료"
+    runtime = apps.patched.spec.template.spec.containers[0]
+    assert next(item.value for item in runtime.env if item.name == "EXTENSIONS_GALLERY") == "{}"
+    assert next(
+        mount.read_only for mount in runtime.volume_mounts
+        if mount.mount_path == "/etc/vscode/policy.json"
+    ) is True
+
+
+def test_jcode_status_requires_deployment_and_service_endpoint(generator, monkeypatch):
+    deployment = SimpleNamespace(
+        metadata=SimpleNamespace(generation=3),
+        spec=SimpleNamespace(replicas=1),
+        status=SimpleNamespace(
+            conditions=[],
+            observed_generation=3,
+            updated_replicas=1,
+            available_replicas=1,
+            ready_replicas=1,
+        ),
+    )
+    core = SimpleNamespace(
+        read_namespaced_endpoints=lambda *_: SimpleNamespace(
+            subsets=[SimpleNamespace(addresses=[SimpleNamespace(ip="10.0.0.1")])]
+        )
+    )
+    apps = SimpleNamespace(read_namespaced_deployment=lambda *_: deployment)
+    monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
+    monkeypatch.setattr(generator, "verify_course_namespace", lambda *_: None)
+
+    result = asyncio.run(generator.get_jcode_status(
+        1,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001-svc",
+        {},
+    ))
+
+    assert result["state"] == "READY"
+
+
+def test_jcode_status_reports_progress_deadline_failure(generator, monkeypatch):
+    deployment = SimpleNamespace(
+        metadata=SimpleNamespace(generation=3),
+        spec=SimpleNamespace(replicas=1),
+        status=SimpleNamespace(
+            conditions=[SimpleNamespace(
+                type="Progressing",
+                status="False",
+                reason="ProgressDeadlineExceeded",
+            )],
+        ),
+    )
+    core = SimpleNamespace()
+    apps = SimpleNamespace(read_namespaced_deployment=lambda *_: deployment)
+    monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
+    monkeypatch.setattr(generator, "verify_course_namespace", lambda *_: None)
+
+    result = asyncio.run(generator.get_jcode_status(
+        1,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001-svc",
+        {},
+    ))
+
+    assert result == {"state": "FAILED", "reasonCode": "DEPLOYMENT_PROGRESS_DEADLINE"}
 
 
 def test_workspace_images_must_use_immutable_harbor_reference(generator, monkeypatch):
@@ -88,7 +251,33 @@ def test_smoke_workspace_paths_are_prepared_and_removed(generator, monkeypatch, 
 
     assert not workspace_path.exists()
     assert not extension_path.exists()
-    assert (tmp_path / "extensions").is_dir()
+    assert (tmp_path / "extensions-v2").is_dir()
+
+
+def test_workspace_extensions_directory_is_a_safe_single_segment(generator, monkeypatch, tmp_path):
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setenv("WORKSPACE_EXTENSIONS_DIR", "../extensions")
+
+    with pytest.raises(RuntimeError, match="WORKSPACE_EXTENSIONS_DIR"):
+        generator.get_workspace_extensions_root()
+
+
+def test_workspace_extension_is_prepared_lazily_for_existing_members(generator, monkeypatch, tmp_path):
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(os, "chown", lambda *_: None)
+
+    path = generator.prepare_workspace_extension("20260001")
+
+    assert path == tmp_path / "extensions-v2" / "20260001"
+    assert path.is_dir()
+
+
+def test_workspace_extension_rejects_invalid_student_number(generator, monkeypatch, tmp_path):
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+
+    with pytest.raises(generator.HTTPException, match="student_num"):
+        generator.get_workspace_extension_subpath("../escape")
 
 
 @pytest.mark.parametrize(
@@ -287,3 +476,11 @@ def test_managed_config_map_is_replaced_with_resource_version(generator):
 
     assert core_v1.replaced.metadata.resource_version == "17"
     assert "config.yaml" in core_v1.replaced.data
+    assert '"AllowedExtensions"' in core_v1.replaced.data["policy.json"]
+    assert '"*": false' in core_v1.replaced.data["policy.json"]
+    policy = json.loads(core_v1.replaced.data["policy.json"])
+    assert policy["ChatAgentMode"] is False
+    assert policy["ChatMCP"] == "none"
+    assert policy["ChatAllowedMcpServers"] == []
+    assert policy["Claude3PIntegration"] is False
+    assert policy["Codex3PIntegration"] is False

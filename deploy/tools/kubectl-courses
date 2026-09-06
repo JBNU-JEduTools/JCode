@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+environment=""
+no_headers=false
+
+usage() {
+  cat <<'EOF'
+Usage: kubectl courses [--env dev|prod] [--no-headers]
+
+List JCode course namespaces using their human-readable metadata.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --env)
+      [[ $# -ge 2 ]] || { echo "--env requires dev or prod" >&2; exit 2; }
+      environment=$2
+      shift 2
+      ;;
+    --no-headers)
+      no_headers=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+selector="role=jcode"
+if [[ -n "$environment" ]]; then
+  [[ "$environment" == "dev" || "$environment" == "prod" ]] || {
+    echo "--env must be dev or prod" >&2
+    exit 2
+  }
+  selector+=",jcode.io/environment=$environment"
+fi
+
+args=(
+  get namespaces
+  --selector "$selector"
+  --sort-by .metadata.name
+  --output 'custom-columns=NAMESPACE:.metadata.name,COURSE:.metadata.annotations.jcode\.io/display-name,STATE:.status.phase'
+)
+if [[ "$no_headers" == true ]]; then
+  args+=(--no-headers)
+fi
+
+exec kubectl "${args[@]}"

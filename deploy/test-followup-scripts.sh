@@ -16,6 +16,39 @@ set -euo pipefail
 printf '%q ' "$@" >> "$MOCK_LOG"
 printf '\n' >> "$MOCK_LOG"
 
+if [[ ${MOCK_MODE:-} == storage ]]; then
+  if [[ $1 == wait && $2 == -n ]]; then
+    exit 0
+  fi
+  if [[ $1 == get && $2 == pvc ]]; then
+    printf '%s' pvc-volume
+    exit 0
+  fi
+  if [[ $1 == get && $2 == pv ]]; then
+    case "$*" in
+      *'.spec.nfs.server'*|*'.spec.nfs.path'*) exit 0 ;;
+      *'.spec.csi.driver'*) printf '%s' driver.longhorn.io ;;
+      *'.spec.csi.volumeHandle'*) printf '%s' pvc-11111111-2222-3333-4444-555555555555 ;;
+      *) exit 2 ;;
+    esac
+    exit 0
+  fi
+  if [[ $1 == get && $2 == service ]]; then
+    printf '%s' 10.233.9.148
+    exit 0
+  fi
+  if [[ $1 == patch && $2 == configmap ]]; then
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --patch ]]; then
+        printf '%s' "$2" > "$MOCK_CONFIG"
+        exit 0
+      fi
+      shift
+    done
+  fi
+  exit 2
+fi
+
 if [[ ${MOCK_MODE:-} == config ]]; then
   if [[ $1 == patch && $2 == configmap ]]; then
     patch_type=
@@ -159,6 +192,20 @@ jq -e '
   (.data | has("GENERATOR_URL") | not)
 ' "$config_file" >/dev/null
 [[ $(grep -c '/data/GENERATOR_URL' "$MOCK_LOG") -eq 1 ]]
+
+: > "$MOCK_LOG"
+export MOCK_MODE=storage
+storage_patch="$state_dir/storage-patch.json"
+export MOCK_CONFIG="$storage_patch"
+JCODE_NAMESPACE=watcher GENERATOR_CONFIGMAP_NAME=jcode-generator-configmap \
+  "$repo_root/generator/k8s/configure-workspace-storage.sh"
+jq -e '
+  .data.NFS_SERVER == "10.233.9.148" and
+  .data.NFS_PATH == "/pvc-11111111-2222-3333-4444-555555555555" and
+  .data.NFS_MOUNT_PATH == "/nfs-data" and
+  .data.WORKSPACE_EXTENSIONS_DIR == "extensions-v2"
+' "$storage_patch" >/dev/null
+grep -q 'get service pvc-11111111-2222-3333-4444-555555555555' "$MOCK_LOG"
 
 : > "$MOCK_LOG"
 export MOCK_MODE=rbac

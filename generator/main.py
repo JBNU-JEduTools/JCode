@@ -75,6 +75,39 @@ WORKSPACE_PROXY_NAMESPACE = os.getenv("WORKSPACE_PROXY_NAMESPACE", "").strip()
 WORKSPACE_PROXY_POD_LABEL = os.getenv("WORKSPACE_PROXY_POD_LABEL", "").strip()
 WORKSPACE_PROXY_PORT = int(os.getenv("WORKSPACE_PROXY_PORT", "3000"))
 DEFAULT_HARBOR_REGISTRY = "harbor.jedutools.io"
+GENERAL_WORKSPACE_SUFFIX = "의 JCode.code-workspace"
+PERSONAL_WORKSPACE_LABEL = "내 작업공간"
+PERSONAL_WORKSPACE_README = """# 내 작업공간
+
+이 폴더는 과제와 별도로 자유롭게 사용하는 개인 JCode 공간입니다.
+
+- 일반 작업은 이 폴더에 저장하세요.
+- 과제 작업은 탐색기에 표시된 과제명 폴더를 사용하세요.
+- JCode 실행 화면에서는 내 작업공간과 현재 열린 과제를 함께 사용할 수 있습니다.
+"""
+WORKSPACE_SETTINGS = {
+    "chat.disableAIFeatures": True,
+    "chat.commandCenter.enabled": False,
+    "workbench.settings.showAISearchToggle": False,
+    "extensions.autoCheckUpdates": False,
+    "extensions.autoUpdate": False,
+    "telemetry.telemetryLevel": "off",
+}
+CODE_SERVER_POLICY = {
+    "AllowedExtensions": {"*": False},
+    "ChatAgentMode": False,
+    "ChatAgentExtensionTools": False,
+    "ChatPluginsEnabled": False,
+    "ChatStrictMarketplaces": True,
+    "ChatMCP": "none",
+    "ChatAllowedMcpServers": [],
+    "ChatAllowManagedMcpServersOnly": True,
+    "Claude3PIntegration": False,
+    "Codex3PIntegration": False,
+    "ExtensionsAutoUpdate": False,
+    "EnableTelemetry": False,
+    "UpdateMode": "none",
+}
 WORKSPACE_NO_PROXY = os.getenv(
     "WORKSPACE_NO_PROXY",
     "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local",
@@ -151,10 +184,12 @@ class DeployRequest(BaseModel):
     egress_policy: str = "PACKAGE_PROXY"
     workspace_scope: str = "COURSE"
     assignment_workspace_key: Optional[str] = None
+    workspace_display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     use_snapshot: bool
-    hw_count: int = Field(default=10, ge=0, le=100)
+    hw_count: int = Field(default=0, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
     assignment_dirs: list[str] = Field(default=[])
+    assignment_labels: dict[str, str] = Field(default={})
 
 class DeleteRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -165,6 +200,11 @@ class DeleteRequest(BaseModel):
 class NamespaceRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
+    course_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    professor_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    year: Optional[int] = Field(default=None, ge=2000, le=2100)
+    term: Optional[int] = Field(default=None, ge=1, le=2)
+    class_section: Optional[int] = Field(default=None, ge=1, le=999)
     use_vnc: bool = False
     environment_profile: str = "ALGORITHM"
     use_jupyter: bool = False
@@ -172,6 +212,14 @@ class NamespaceRequest(BaseModel):
     resource_profile: str = "STANDARD"
     egress_policy: str = "PACKAGE_PROXY"
     workspace_scope: str = "COURSE"
+
+class NamespaceMetadataRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    course_name: str = Field(min_length=1, max_length=100)
+    professor_name: str = Field(min_length=1, max_length=50)
+    year: int = Field(ge=2000, le=2100)
+    term: int = Field(ge=1, le=2)
+    class_section: int = Field(ge=1, le=999)
 
 class ProvisionRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -183,6 +231,7 @@ class AssignmentProvisionRequest(BaseModel):
     namespace: str
     workspace_key: str
     legacy_dir_name: Optional[str] = None
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
 
 class StarterDistributeRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -196,6 +245,7 @@ class AssignmentArchiveRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     workspace_key: str
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     retention_days: int = Field(default=90, ge=1, le=3650)
     starter_artifact_key: Optional[str] = None
     starter_checksum: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -213,7 +263,9 @@ class StudentProvisionRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     student_num: str
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     workspace_keys: list[str] = Field(default=[])
+    workspace_labels: dict[str, str] = Field(default={})
     artifacts: list[StudentArtifactRef] = Field(default=[])
 
 class StudentArchiveRequest(BaseModel):
@@ -332,8 +384,16 @@ def build_code_server_args(use_vnc: bool) -> list[str]:
             configured[0:0] = ["--bind-addr", "0.0.0.0:8080"]
         if not any(arg == "--auth" or arg.startswith("--auth=") for arg in configured):
             configured.extend(["--auth", "none"])
-    if "--restrict-workspace-root" not in configured:
-        configured.extend(["--restrict-workspace-root", get_workspace_root()])
+    if not any(arg == "--extensions-dir" or arg.startswith("--extensions-dir=") for arg in configured):
+        configured.extend(["--extensions-dir", "/home/coder/extensions"])
+    if "--disable-workspace-trust" not in configured:
+        configured.append("--disable-workspace-trust")
+    if "--disable-telemetry" not in configured:
+        configured.append("--disable-telemetry")
+    if "--disable-update-check" not in configured:
+        configured.append("--disable-update-check")
+    if any(arg == "--restrict-workspace-root" or arg.startswith("--restrict-workspace-root=") for arg in configured):
+        raise RuntimeError("현재 code-server는 --restrict-workspace-root 옵션을 지원하지 않습니다.")
     if get_workspace_root() not in configured:
         configured.append(get_workspace_root())
     return configured
@@ -473,6 +533,32 @@ def get_nfs_workspace_path() -> Path:
     return mount_path / "workspace"
 
 
+def get_workspace_extensions_root() -> Path:
+    directory = os.getenv("WORKSPACE_EXTENSIONS_DIR", "extensions-v2").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", directory):
+        raise RuntimeError("WORKSPACE_EXTENSIONS_DIR는 안전한 단일 디렉터리 이름이어야 합니다.")
+    return Path(NFS_MOUNT_PATH) / directory
+
+
+def get_workspace_extension_path(student_num: str) -> Path:
+    if not re.fullmatch(r"[0-9]{1,20}", student_num):
+        raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
+    return get_workspace_extensions_root() / student_num
+
+
+def get_workspace_extension_subpath(student_num: str) -> str:
+    return str(get_workspace_extension_path(student_num).relative_to(Path(NFS_MOUNT_PATH)))
+
+
+def prepare_workspace_extension(student_num: str) -> Path:
+    validate_nfs_mount()
+    path = get_workspace_extension_path(student_num)
+    reject_symlink_path(path.parent, path)
+    path.mkdir(parents=True, exist_ok=True)
+    os.chown(path, 1000, 1000)
+    return path
+
+
 def get_starter_artifact_root() -> Path:
     root = Path(os.getenv("STARTER_ARTIFACT_ROOT", "/starter-data").strip())
     if not root.is_absolute():
@@ -541,6 +627,207 @@ def reject_symlink_path(root: Path, candidate: Path) -> None:
         candidate.resolve(strict=False).relative_to(root)
     except ValueError as error:
         raise HTTPException(status_code=400, detail="관리 경로가 허용 범위를 벗어납니다.") from error
+
+
+def validate_workspace_display_name(value: str, max_length: int = 100) -> str:
+    label = value.strip()
+    if not label or len(label) > max_length or any(ord(character) < 32 for character in label):
+        raise HTTPException(status_code=400, detail="display_name 형식이 올바르지 않습니다.")
+    return label
+
+
+def general_workspace_filename(display_name: str) -> str:
+    label = validate_workspace_display_name(display_name, 50)
+    if re.search(r'[\\/:*?"<>|]', label):
+        raise HTTPException(status_code=400, detail="display_name에 파일명으로 사용할 수 없는 문자가 있습니다.")
+    return f"{label}{GENERAL_WORKSPACE_SUFFIX}"
+
+
+def assignment_workspace_filename(display_name: str) -> str:
+    label = validate_workspace_display_name(display_name, 50)
+    safe_label = re.sub(r'[\\/:*?"<>|]', "_", label).strip().strip(".")[:50]
+    return f"{safe_label or '과제'}.code-workspace"
+
+
+def ensure_personal_workspace_readme(personal_workspace: Path) -> None:
+    readme = personal_workspace / "README.md"
+    reject_symlink_path(personal_workspace, readme)
+    try:
+        with readme.open("x", encoding="utf-8") as output:
+            output.write(PERSONAL_WORKSPACE_README)
+    except FileExistsError:
+        return
+    os.chown(readme, 1000, 1000)
+    os.chmod(readme, 0o640)
+
+
+def remove_empty_legacy_workspace_dirs(student_dir: Path) -> None:
+    for candidate in student_dir.iterdir():
+        if candidate.is_symlink() or not re.fullmatch(r"(?:hw|prac)[1-9][0-9]*", candidate.name):
+            continue
+        try:
+            candidate.rmdir()
+        except OSError:
+            # A non-empty legacy directory may contain user work and must be preserved.
+            continue
+
+
+def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> None:
+    metadata_dir = student_dir / ".jcode"
+    descriptor = metadata_dir / filename
+    descriptor_dir = descriptor.parent
+    reject_symlink_path(student_dir, metadata_dir)
+    reject_symlink_path(student_dir, descriptor_dir)
+    reject_symlink_path(student_dir, descriptor)
+    descriptor_dir.mkdir(parents=True, exist_ok=True)
+    if not descriptor_dir.is_dir():
+        raise HTTPException(status_code=409, detail="Workspace 메타데이터 경로를 사용할 수 없습니다.")
+    os.chown(descriptor_dir, 1000, 1000)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=descriptor_dir,
+        prefix=f".{descriptor.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        json.dump(payload, temporary, ensure_ascii=False, indent=2)
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    try:
+        os.chown(temporary_path, 1000, 1000)
+        os.chmod(temporary_path, 0o640)
+        os.replace(temporary_path, descriptor)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def read_assignment_workspace_entries(student_dir: Path) -> list[dict[str, str]]:
+    metadata_dir = student_dir / ".jcode"
+    if not metadata_dir.is_dir() or metadata_dir.is_symlink():
+        return []
+    entries = []
+    descriptors = sorted(
+        metadata_dir.glob("assignment-*.code-workspace"),
+        key=lambda path: int(path.name.removeprefix("assignment-").removesuffix(".code-workspace"))
+        if re.fullmatch(r"assignment-[1-9][0-9]*\.code-workspace", path.name)
+        else 0,
+    )
+    for descriptor in descriptors:
+        workspace_key = descriptor.name.removesuffix(".code-workspace")
+        if not re.fullmatch(r"assignment-[1-9][0-9]*", workspace_key):
+            continue
+        if not (student_dir / workspace_key).is_dir() or descriptor.is_symlink():
+            continue
+        try:
+            folders = json.loads(descriptor.read_text(encoding="utf-8")).get("folders", [])
+            label = validate_workspace_display_name(folders[0]["name"], 50)
+        except (OSError, json.JSONDecodeError, IndexError, KeyError, TypeError, HTTPException):
+            continue
+        entries.append({"name": label, "path": f"../{workspace_key}"})
+    return entries
+
+
+def remove_stale_assignment_workspace_descriptors(student_dir: Path, workspace_keys: list[str]) -> None:
+    metadata_dir = student_dir / ".jcode"
+    if not metadata_dir.is_dir() or metadata_dir.is_symlink():
+        return
+    active_keys = set(workspace_keys)
+    for descriptor in metadata_dir.glob("assignment-*.code-workspace"):
+        workspace_key = descriptor.name.removesuffix(".code-workspace")
+        if re.fullmatch(r"assignment-[1-9][0-9]*", workspace_key) and workspace_key not in active_keys:
+            reject_symlink_path(student_dir, descriptor)
+            descriptor.unlink(missing_ok=True)
+            remove_named_assignment_workspace_descriptor(student_dir, workspace_key)
+
+
+def write_general_workspace_descriptor(student_dir: Path, display_name: Optional[str] = None) -> None:
+    """Expose a personal workspace and named assignments without leaking storage keys."""
+    metadata_dir = student_dir / ".jcode"
+    profile = metadata_dir / "profile.json"
+    if display_name is not None:
+        label = validate_workspace_display_name(display_name, 50)
+    else:
+        try:
+            label = validate_workspace_display_name(
+                json.loads(profile.read_text(encoding="utf-8"))["display_name"], 50
+            )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, HTTPException):
+            label = student_dir.name.rsplit("-", 1)[-1]
+
+    descriptor_name = general_workspace_filename(label)
+    write_workspace_json(
+        student_dir,
+        "profile.json",
+        {"display_name": label, "general_workspace_file": descriptor_name},
+    )
+
+    personal_workspace = student_dir / "workspace"
+    reject_symlink_path(student_dir, personal_workspace)
+    personal_workspace.mkdir(parents=True, exist_ok=True)
+    if not personal_workspace.is_dir():
+        raise HTTPException(status_code=409, detail="사용자 작업공간 경로를 사용할 수 없습니다.")
+    os.chown(personal_workspace, 1000, 1000)
+    ensure_personal_workspace_readme(personal_workspace)
+    remove_empty_legacy_workspace_dirs(student_dir)
+    payload = {
+        "folders": [
+            {"name": PERSONAL_WORKSPACE_LABEL, "path": "../workspace"},
+            *read_assignment_workspace_entries(student_dir),
+        ],
+        "settings": WORKSPACE_SETTINGS,
+    }
+    write_workspace_json(student_dir, descriptor_name, payload)
+    # Keep the old path during rolling upgrades; new Backend instances open the named file.
+    write_workspace_json(student_dir, "jcode.code-workspace", payload)
+    for stale in metadata_dir.glob(f"*{GENERAL_WORKSPACE_SUFFIX}"):
+        if stale.name != descriptor_name and not stale.is_symlink():
+            stale.unlink(missing_ok=True)
+
+
+def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str, display_name: Optional[str]) -> None:
+    """Keep the stable directory key while showing the configured assignment name in code-server."""
+    if display_name is None:
+        return
+    label = validate_workspace_display_name(display_name, 50)
+    settings = {"settings": WORKSPACE_SETTINGS}
+    write_workspace_json(student_dir, f"{workspace_key}.code-workspace", {
+        "folders": [{"name": label, "path": f"../{workspace_key}"}],
+        **settings,
+    })
+    named_dir = student_dir / ".jcode" / "assignments" / workspace_key
+    named_filename = assignment_workspace_filename(label)
+    write_workspace_json(student_dir, f"assignments/{workspace_key}/{named_filename}", {
+        "folders": [{"name": label, "path": f"../../../{workspace_key}"}],
+        **settings,
+    })
+    for stale in named_dir.glob("*.code-workspace"):
+        if stale.name != named_filename and not stale.is_symlink():
+            stale.unlink(missing_ok=True)
+    write_general_workspace_descriptor(student_dir)
+
+
+def remove_named_assignment_workspace_descriptor(student_dir: Path, workspace_key: str) -> None:
+    named_dir = student_dir / ".jcode" / "assignments" / workspace_key
+    reject_symlink_path(student_dir, named_dir)
+    if named_dir.is_dir():
+        for descriptor in named_dir.glob("*.code-workspace"):
+            reject_symlink_path(student_dir, descriptor)
+            descriptor.unlink(missing_ok=True)
+        try:
+            named_dir.rmdir()
+            named_dir.parent.rmdir()
+        except OSError:
+            pass
+
+
+def remove_assignment_workspace_descriptor(student_dir: Path, workspace_key: str) -> None:
+    metadata_dir = student_dir / ".jcode"
+    descriptor = metadata_dir / f"{workspace_key}.code-workspace"
+    reject_symlink_path(student_dir, descriptor)
+    descriptor.unlink(missing_ok=True)
+    remove_named_assignment_workspace_descriptor(student_dir, workspace_key)
+    write_general_workspace_descriptor(student_dir)
 
 
 def copy_tree_preserving_existing(source: Path, target: Path) -> None:
@@ -617,7 +904,7 @@ def get_smoke_workspace_paths(file_path: str, student_num: str) -> tuple[Path, P
     nfs_root = Path(NFS_MOUNT_PATH).resolve()
     candidates = (
         nfs_root.joinpath(*file_path.split("/")),
-        nfs_root / "extensions" / student_num,
+        get_workspace_extensions_root() / student_num,
     )
     paths = []
     for candidate in candidates:
@@ -652,7 +939,7 @@ def cleanup_smoke_workspace(file_path: str, student_num: str) -> None:
         if path.exists():
             shutil.rmtree(path)
     # workspace/release-smoke는 이 기능 전용이므로 비어 있으면 정리한다.
-    # extensions는 공용 루트이므로 절대 삭제하지 않는다.
+    # 확장 공용 루트는 이 기능의 소유가 아니므로 절대 삭제하지 않는다.
     try:
         paths[0].parent.rmdir()
     except OSError:
@@ -907,29 +1194,30 @@ load_incluster_config_or_fail()
 def create_deployment(
     apps_v1_api, namespace: str, deployment_name: str, app_label: str,
     file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool,
-    hw_count: int = 10, prac_count: int = 0, assignment_dirs: list = None,
+    hw_count: int = 0, prac_count: int = 0, assignment_dirs: list = None,
     environment_profile: str = "ALGORITHM", use_jupyter: bool = False,
     base_image: Optional[str] = None, resource_profile: str = "STANDARD",
     workspace_scope: str = "COURSE", assignment_workspace_key: Optional[str] = None,
 ) -> str:
-    init_volume_mounts=[
-        client.V1VolumeMount(
-            name="jcode-vol",
-            mount_path="/home/coder/.local",
-            sub_path=f"extensions/{student_num}"
-        )
-    ]
+    init_volume_mounts = []
 
     volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
-            mount_path="/home/coder/.local",
-            sub_path=f"extensions/{student_num}"
+            mount_path="/home/coder/extensions",
+            sub_path=get_workspace_extension_subpath(student_num),
+            read_only=True,
         ),
         client.V1VolumeMount(
             name="config-vol",
             mount_path="/home/coder/.config/code-server/config.yaml",
             sub_path="config.yaml"
+        ),
+        client.V1VolumeMount(
+            name="config-vol",
+            mount_path="/etc/vscode/policy.json",
+            sub_path="policy.json",
+            read_only=True,
         )
     ]
 
@@ -957,14 +1245,12 @@ def create_deployment(
         client.V1ContainerPort(container_port=8080)  # 기본적으로 code-server 포트만 설정
     ]
 
-    # 커스텀 fork가 들어간 불변 이미지만 허용한다.
+    # 검증된 Harbor의 불변 이미지 레퍼런스만 허용한다.
     image_name = get_requested_workspace_image(use_vnc, environment_profile, base_image)
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
-        base_cmd = "\
-            chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/.local"
+        base_cmd = "chown -R 1000:1000 /home/coder/project"
         init_volume_mounts.append(
             client.V1VolumeMount(
                 name="snapshot-volume",
@@ -994,19 +1280,15 @@ def create_deployment(
             workspace_key = validate_assignment_workspace_key(assignment_workspace_key)
             file_path = f"{file_path.rstrip('/')}/{workspace_key}"
         if workspace_scope == "ASSIGNMENT":
-            hw_cmd = "true"
-        elif assignment_dirs:
-            safe_dirs = [validate_workspace_dir_name(d) for d in assignment_dirs]
-            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
-            hw_cmd = f"mkdir -p {dirs}"
+            workspace_cmd = "true"
         else:
-            hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
-        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 and not assignment_dirs else ""
+            safe_dirs = ["workspace", *[validate_workspace_dir_name(d) for d in (assignment_dirs or [])]]
+            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
+            workspace_cmd = f"mkdir -p {dirs}"
         base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
-            {hw_cmd}{prac_cmd} && \
-            chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/.local"
+            {workspace_cmd} && \
+            chown -R 1000:1000 /home/coder/project"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
             mount_path="/home/coder/project",
@@ -1047,6 +1329,7 @@ def create_deployment(
         client.V1EnvVar(name="AUTH", value="none"),
         client.V1EnvVar(name="DISPLAY", value=":1"),  # VNC Display 설정
         client.V1EnvVar(name="JUPYTER_ENABLED", value=str(use_jupyter).lower()),
+        client.V1EnvVar(name="EXTENSIONS_GALLERY", value="{}"),
     ] + get_code_server_extra_env(use_vnc) + get_workspace_proxy_env()
 
     deployment = client.V1Deployment(
@@ -1055,6 +1338,7 @@ def create_deployment(
         metadata=client.V1ObjectMeta(name=deployment_name, namespace=namespace, labels={"app": app_label}),
         spec=client.V1DeploymentSpec(
             replicas=1,
+            progress_deadline_seconds=600,
             selector=client.V1LabelSelector(match_labels={"app": app_label}),
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
@@ -1086,6 +1370,13 @@ def create_deployment(
                             image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
                             args=code_server_args,
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
+                            readiness_probe=client.V1Probe(
+                                tcp_socket=client.V1TCPSocketAction(port=8080),
+                                initial_delay_seconds=2,
+                                period_seconds=2,
+                                timeout_seconds=1,
+                                failure_threshold=30,
+                            ),
                             env=code_server_env,
                             resources=get_workspace_resources(resource_profile),
                             volume_mounts=volume_mounts,  # 동적으로 만든 volume_mounts 리스트 적용
@@ -1107,10 +1398,16 @@ def create_deployment(
         logger.info(f"Deployment '{deployment_name}' 생성 완료")
         return f"Deployment '{deployment_name}' 생성 완료"
     except ApiException as e:
-        logger.exception("Deployment 생성 중 오류:")
         if e.status == 409:
-            return f"Deployment '{deployment_name}'가 이미 존재합니다."
+            apps_v1_api.patch_namespaced_deployment(
+                name=deployment_name,
+                namespace=namespace,
+                body=deployment,
+            )
+            logger.info(f"Deployment '{deployment_name}' 갱신 완료")
+            return f"Deployment '{deployment_name}' 갱신 완료"
         else:
+            logger.exception("Deployment 생성 중 오류:")
             raise Exception(f"Deployment 생성 중 오류: {e}")
 
 def create_service(core_v1_api, namespace: str, service_name: str, app_label: str, use_vnc: bool) -> str:
@@ -1211,6 +1508,15 @@ def resolve_namespace(ns: str) -> str:
     validate_namespace(ns)
     return ns
 
+
+K8S_RESOURCE_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+
+
+def validate_resource_name(name: str) -> str:
+    if len(name) > 63 or not K8S_RESOURCE_NAME_PATTERN.fullmatch(name):
+        raise HTTPException(status_code=400, detail="Kubernetes 리소스 이름 형식이 올바르지 않습니다.")
+    return name
+
 def ensure_course_metadata(core_v1_api, namespace: str, course_id: int):
     name = "jcode-course-metadata"
     expected = {
@@ -1273,7 +1579,46 @@ def verify_course_namespace(core_v1_api, namespace: str, course_id: int):
         raise HTTPException(status_code=403, detail="Namespace 환경 정보가 현재 Controller와 일치하지 않습니다.")
 
 
-def ensure_namespace_metadata(core_v1_api, namespace: str, course_id: int):
+def course_namespace_annotations(
+    course_id: int,
+    course_name: Optional[str] = None,
+    professor_name: Optional[str] = None,
+    year: Optional[int] = None,
+    term: Optional[int] = None,
+    class_section: Optional[int] = None,
+) -> dict[str, str]:
+    annotations = {
+        "jcode.io/course-id": str(course_id),
+        "jcode.io/environment": JCODE_ENVIRONMENT,
+    }
+    optional_values = {
+        "jcode.io/course-name": course_name,
+        "jcode.io/professor-name": professor_name,
+    }
+    for key, value in optional_values.items():
+        if value is None:
+            continue
+        normalized = value.strip()
+        if not normalized or re.search(r"[\x00-\x1f\x7f]", normalized):
+            raise HTTPException(status_code=422, detail="강의 metadata에 사용할 수 없는 문자가 포함되어 있습니다.")
+        annotations[key] = normalized
+    if all(value is not None for value in (course_name, professor_name, year, term, class_section)):
+        annotations["jcode.io/display-name"] = (
+            f"{year}-{term} | {course_name.strip()} | {professor_name.strip()} | {class_section}분반"
+        )
+    return annotations
+
+
+def ensure_namespace_metadata(
+    core_v1_api,
+    namespace: str,
+    course_id: int,
+    course_name: Optional[str] = None,
+    professor_name: Optional[str] = None,
+    year: Optional[int] = None,
+    term: Optional[int] = None,
+    class_section: Optional[int] = None,
+):
     """기존 namespace의 강의 소유권을 확인하고 Admission용 metadata를 보완한다."""
     existing = core_v1_api.read_namespace(name=namespace)
     annotations = existing.metadata.annotations or {}
@@ -1298,8 +1643,9 @@ def ensure_namespace_metadata(core_v1_api, namespace: str, course_id: int):
                     "jcode.io/environment": JCODE_ENVIRONMENT,
                 },
                 "annotations": {
-                    "jcode.io/course-id": str(course_id),
-                    "jcode.io/environment": JCODE_ENVIRONMENT,
+                    **course_namespace_annotations(
+                        course_id, course_name, professor_name, year, term, class_section
+                    ),
                 },
             }
         },
@@ -1339,7 +1685,10 @@ def ensure_code_server_config(core_v1_api, namespace: str):
         core_v1_api,
         namespace,
         "code-server-config",
-        {"config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"},
+        {
+            "config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n",
+            "policy.json": json.dumps(CODE_SERVER_POLICY, ensure_ascii=False, indent=2) + "\n",
+        },
     )
 
 
@@ -1470,6 +1819,11 @@ def init_namespace(
     core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api,
     namespace: str, course_id: int, use_vnc: bool = False,
     egress_policy: str = "PACKAGE_PROXY",
+    course_name: Optional[str] = None,
+    professor_name: Optional[str] = None,
+    year: Optional[int] = None,
+    term: Optional[int] = None,
+    class_section: Optional[int] = None,
 ):
     """고정된 namespace metadata와 runtime 권한으로 강의 공간을 초기화합니다."""
 
@@ -1483,10 +1837,9 @@ def init_namespace(
                 "jcode.io/course-id": str(course_id),
                 "jcode.io/environment": JCODE_ENVIRONMENT,
             },
-            annotations={
-                "jcode.io/course-id": str(course_id),
-                "jcode.io/environment": JCODE_ENVIRONMENT,
-            },
+            annotations=course_namespace_annotations(
+                course_id, course_name, professor_name, year, term, class_section
+            ),
         )
     )
     try:
@@ -1495,7 +1848,10 @@ def init_namespace(
     except ApiException as e:
         if e.status == 409:
             logger.info(f"Namespace '{namespace}'가 이미 존재합니다.")
-            ensure_namespace_metadata(core_v1_api, namespace, course_id)
+            ensure_namespace_metadata(
+                core_v1_api, namespace, course_id,
+                course_name, professor_name, year, term, class_section,
+            )
         else:
             raise
 
@@ -1748,12 +2104,39 @@ async def create_namespace_api(
             request.course_id,
             request.use_vnc,
             request.egress_policy,
+            request.course_name,
+            request.professor_name,
+            request.year,
+            request.term,
+            request.class_section,
         )
         return {"msg": f"Namespace '{namespace}' 초기화 완료", "namespace": namespace}
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/namespace/{ns}/metadata")
+async def update_namespace_metadata_api(
+    ns: str,
+    request: NamespaceMetadataRequest,
+    token_payload: dict = Depends(require_service_scope("namespace:write", "bootstrap")),
+):
+    """강의 표시 metadata를 기존 Namespace에 동기화한다."""
+    namespace = resolve_namespace(ns)
+    try:
+        ensure_namespace_metadata(
+            client.CoreV1Api(), namespace, request.course_id,
+            request.course_name, request.professor_name,
+            request.year, request.term, request.class_section,
+        )
+        return {"msg": "Namespace metadata 동기화 완료", "namespace": namespace}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("네임스페이스 metadata 동기화 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1884,6 +2267,29 @@ async def deploy_resources(
             request.workspace_scope,
         )
         verify_course_namespace(core_v1_api, namespace, request.course_id)
+        prepare_workspace_extension(request.student_num)
+        if not request.use_snapshot and request.workspace_scope == "COURSE":
+            workspace_keys = [validate_assignment_workspace_key(value) for value in request.assignment_dirs]
+            unknown_labels = set(request.assignment_labels) - set(workspace_keys)
+            if unknown_labels:
+                raise HTTPException(status_code=400, detail="assignment_labels에 알 수 없는 workspace_key가 있습니다.")
+            class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+            workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+            reject_symlink_path(workspace.parent, workspace)
+            workspace.mkdir(parents=True, exist_ok=True)
+            os.chown(workspace, 1000, 1000)
+            for workspace_key in workspace_keys:
+                assignment_path = workspace / workspace_key
+                reject_symlink_path(workspace, assignment_path)
+                assignment_path.mkdir(parents=True, exist_ok=True)
+                os.chown(assignment_path, 1000, 1000)
+                write_assignment_workspace_descriptor(
+                    workspace,
+                    workspace_key,
+                    request.assignment_labels.get(workspace_key),
+                )
+            remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
+            write_general_workspace_descriptor(workspace, request.workspace_display_name)
         ensure_code_server_config(core_v1_api, namespace)
         if request.use_vnc:
             ensure_watcher_hook_config(core_v1_api, namespace)
@@ -1928,6 +2334,65 @@ async def deploy_resources(
     except Exception as e:
         logger.exception("리소스 배포 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/jcode/status")
+async def get_jcode_status(
+    course_id: int,
+    namespace: str,
+    deployment_name: str,
+    service_name: str,
+    token_payload: dict = Depends(require_service_scope("jcode:read", "workspace")),
+):
+    """Report readiness only after both the Deployment and Service endpoint are ready."""
+    namespace = resolve_namespace(namespace)
+    deployment_name = validate_resource_name(deployment_name)
+    service_name = validate_resource_name(service_name)
+    core_v1_api = client.CoreV1Api()
+    apps_v1_api = client.AppsV1Api()
+    verify_course_namespace(core_v1_api, namespace, course_id)
+
+    try:
+        deployment = apps_v1_api.read_namespaced_deployment(deployment_name, namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "PENDING", "reasonCode": "DEPLOYMENT_PENDING"}
+        raise
+
+    conditions = deployment.status.conditions or []
+    if any(
+        condition.type == "Progressing"
+        and condition.status == "False"
+        and condition.reason == "ProgressDeadlineExceeded"
+        for condition in conditions
+    ):
+        return {"state": "FAILED", "reasonCode": "DEPLOYMENT_PROGRESS_DEADLINE"}
+
+    desired = deployment.spec.replicas or 1
+    deployment_ready = (
+        (deployment.status.observed_generation or 0) >= (deployment.metadata.generation or 0)
+        and (deployment.status.updated_replicas or 0) >= desired
+        and (deployment.status.available_replicas or 0) >= desired
+        and (deployment.status.ready_replicas or 0) >= desired
+    )
+    if not deployment_ready:
+        return {"state": "PENDING", "reasonCode": "DEPLOYMENT_NOT_READY"}
+
+    try:
+        endpoints = core_v1_api.read_namespaced_endpoints(service_name, namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "PENDING", "reasonCode": "SERVICE_ENDPOINT_PENDING"}
+        raise
+    endpoint_ready = any(subset.addresses for subset in (endpoints.subsets or []))
+    if not endpoint_ready:
+        return {"state": "PENDING", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}
+
+    return {
+        "state": "READY",
+        "reasonCode": "READY",
+        "jcodeUrl": f"http://{service_name}.{namespace}.svc.cluster.local:8080",
+    }
     
 @app.delete("/api/jcode")
 async def delete_resources(
@@ -1938,7 +2403,6 @@ async def delete_resources(
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
-    verify_course_namespace(core_v1_api, namespace, request.course_id)
 
     # 네임스페이스 존재 여부 확인
     try:
@@ -1947,6 +2411,8 @@ async def delete_resources(
         if e.status == 404:
             return {"msg": f"Namespace '{namespace}'와 JCode 리소스는 이미 없습니다."}
         raise
+
+    verify_course_namespace(core_v1_api, namespace, request.course_id)
 
     try:
         # 삭제 시에는 file_path, app_label 등은 사용하지 않고 이름만 사용
@@ -2025,14 +2491,15 @@ async def provision_assignment_workspace(
                     status_code=409,
                     detail=f"기존 경로와 새 경로가 함께 존재합니다: {student_dir.name}",
                 )
-            continue
-        if source and source.exists():
-            source.rename(target)
-            migrated += 1
         else:
-            target.mkdir(parents=True, exist_ok=True)
-            created += 1
+            if source and source.exists():
+                source.rename(target)
+                migrated += 1
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+                created += 1
         os.chown(target, 1000, 1000)
+        write_assignment_workspace_descriptor(student_dir, workspace_key, request.display_name)
     return {"workspace_key": workspace_key, "migrated": migrated, "created": created}
 
 
@@ -2127,6 +2594,7 @@ async def archive_assignment_workspace(
             source = final_source
         destination = resolve_below(archive_root, f"{class_div}/{student_dir.name}/{workspace_key}")
         if not source.exists():
+            remove_assignment_workspace_descriptor(student_dir, workspace_key)
             continue
         if destination.exists():
             raise HTTPException(status_code=409, detail=f"보관 경로가 이미 존재합니다: {student_dir.name}")
@@ -2140,6 +2608,7 @@ async def archive_assignment_workspace(
                 "archived_at": int(time.time()),
             },
         )
+        remove_assignment_workspace_descriptor(student_dir, workspace_key)
         archived += 1
     return {"workspace_key": workspace_key, "archived": archived}
 
@@ -2151,6 +2620,7 @@ def move_assignment_between_workspace_and_final_archive(
     restore: bool,
     starter_artifact: Optional[Path] = None,
     starter_overwrite_policy: str = "PRESERVE_EXISTING",
+    display_name: Optional[str] = None,
 ) -> int:
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     archive_root = get_workspace_archive_root()
@@ -2161,12 +2631,17 @@ def move_assignment_between_workspace_and_final_archive(
         source, destination = (final_path, workspace_path) if restore else (workspace_path, final_path)
         if not source.exists():
             if destination.exists():
+                if restore:
+                    write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
+                else:
+                    remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
             if restore:
                 destination.mkdir(parents=True, exist_ok=True)
                 os.chown(destination, 1000, 1000)
                 if starter_artifact is not None:
                     apply_starter_artifact(starter_artifact, destination, starter_overwrite_policy)
+                write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
                 moved += 1
             continue
         if destination.exists():
@@ -2184,6 +2659,10 @@ def move_assignment_between_workspace_and_final_archive(
                     "archived_at": int(time.time()),
                 },
             )
+        if restore:
+            write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
+        else:
+            remove_assignment_workspace_descriptor(student_dir, workspace_key)
         moved += 1
     return moved
 
@@ -2233,6 +2712,7 @@ async def restore_assignment_workspace(
         restore=True,
         starter_artifact=starter_artifact,
         starter_overwrite_policy=request.starter_overwrite_policy,
+        display_name=request.display_name,
     )
     return {"restored": True, "workspace_key": workspace_key, "moved": moved}
 
@@ -2244,20 +2724,23 @@ async def provision_student_workspace(
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
-    if not re.fullmatch(r"[0-9]{1,20}", request.student_num):
-        raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
+    workspace_keys = [validate_assignment_workspace_key(value) for value in request.workspace_keys]
+    unknown_labels = set(request.workspace_labels) - set(workspace_keys)
+    if unknown_labels:
+        raise HTTPException(status_code=400, detail="workspace_labels에 알 수 없는 workspace_key가 있습니다.")
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
-    extensions = Path(NFS_MOUNT_PATH) / "extensions" / request.student_num
-    for path in (workspace, extensions):
-        reject_symlink_path(path.parent, path)
-        path.mkdir(parents=True, exist_ok=True)
-        os.chown(path, 1000, 1000)
-    for value in request.workspace_keys:
-        assignment_path = workspace / validate_assignment_workspace_key(value)
+    prepare_workspace_extension(request.student_num)
+    reject_symlink_path(workspace.parent, workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    os.chown(workspace, 1000, 1000)
+    for workspace_key in workspace_keys:
+        assignment_path = workspace / workspace_key
         reject_symlink_path(workspace, assignment_path)
         assignment_path.mkdir(parents=True, exist_ok=True)
         os.chown(assignment_path, 1000, 1000)
+        write_assignment_workspace_descriptor(workspace, workspace_key, request.workspace_labels.get(workspace_key))
+    remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
     applied = 0
     for artifact_ref in request.artifacts:
         workspace_key = validate_assignment_workspace_key(artifact_ref.workspace_key)
@@ -2269,6 +2752,7 @@ async def provision_student_workspace(
         verify_artifact_checksum(artifact, artifact_ref.checksum)
         apply_starter_artifact(artifact, workspace / workspace_key, artifact_ref.overwrite_policy)
         applied += 1
+    write_general_workspace_descriptor(workspace, request.display_name)
     return {"ready": True, "workspace": workspace.name, "starter_artifacts": applied}
 
 
@@ -2278,23 +2762,47 @@ async def archive_student_workspace(
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     namespace = resolve_namespace(request.namespace)
-    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
     if not re.fullmatch(r"[0-9]{1,20}", request.student_num):
         raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
     if not re.fullmatch(r"[0-9a-f-]{36}", request.archive_key):
         raise HTTPException(status_code=400, detail="archive_key 형식이 올바르지 않습니다.")
-    apps_api = client.AppsV1Api()
-    core_api = client.CoreV1Api()
-    for name in request.deployments:
-        delete_deployment(apps_api, namespace, name)
-    for name in request.services:
-        delete_service(core_api, namespace, name)
+
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     source = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
     destination = resolve_below(
         get_workspace_archive_root(),
         f"memberships/{class_div}/{request.student_num}/{request.archive_key}",
     )
+    core_api = client.CoreV1Api()
+    try:
+        existing_namespace = core_api.read_namespace(name=namespace)
+        namespace_exists = True
+    except ApiException as error:
+        if error.status != 404:
+            raise
+        namespace_exists = False
+
+    if namespace_exists:
+        annotations = existing_namespace.metadata.annotations or {}
+        labels = existing_namespace.metadata.labels or {}
+        recorded_course_id = annotations.get("jcode.io/course-id") or labels.get("jcode.io/course-id")
+        if recorded_course_id and recorded_course_id != str(request.course_id):
+            if source.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Namespace가 다른 강의에 재사용되었고 동일한 Workspace 경로가 존재합니다.",
+                )
+            return {
+                "archived": True,
+                "archive_key": request.archive_key,
+                "namespace_reused": True,
+            }
+        verify_course_namespace(core_api, namespace, request.course_id)
+        apps_api = client.AppsV1Api()
+        for name in request.deployments:
+            delete_deployment(apps_api, namespace, name)
+        for name in request.services:
+            delete_service(core_api, namespace, name)
     if source.exists() and destination.exists():
         raise HTTPException(status_code=409, detail="학생 Workspace 원본과 보관본이 함께 존재합니다.")
     if source.exists():

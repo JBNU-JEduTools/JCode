@@ -1,140 +1,73 @@
-# === Builder Stage ===
-ARG JCODE_CODE_SERVER_BASE
-FROM ${JCODE_CODE_SERVER_BASE} AS builder
-
-USER root
-ENV DEBIAN_FRONTEND=noninteractive
-
-# 기본 Debian mirror를 사용한다.
-
-# 필수 패키지 설치 (최종 스테이지에서는 runit 대신 supervisord를 사용할 예정)
-RUN apt-get update && apt-get install --no-install-recommends -y \
-    tigervnc-standalone-server \
-    tigervnc-tools \
-    x11-xserver-utils \
-    openbox \
-    novnc \
-    websockify \
-    python3-tk && \
-    rm -rf /var/lib/apt/lists/*
-
-# Openbox 세션 실행 설정 (최소한의 GUI 환경)
-RUN echo "exec openbox-session" > ~/.xsession && \
-    echo "exec openbox-session" > ~/.xinitrc
-
-# VNC는 ClusterIP + Router 인증 뒤에서만 제공하며 이미지에 공용 비밀번호를 넣지 않는다.
-RUN mkdir -p /root/.vnc
-
-# VNC 서버 실행 테스트 (화면 :1) - 설정 확인용으로 실행 후 종료
-RUN vncserver :1 -geometry 1280x800 -depth 24 -SecurityTypes None && \
-    vncserver -kill :1
-
-# VNC 세션에 openbox 실행 (VNC 접속 시 최소한의 창 관리자만 실행)
-RUN echo "exec openbox-session" > ~/.vnc/xstartup && \
-    chmod +x ~/.vnc/xstartup
-
-# noVNC가 정상 동작하도록 패키지.json 파일 복사 (workaround)
-RUN cp /usr/share/novnc/vnc.html /usr/share/novnc/package.json
-
-# 필요한 설정 파일들을 /runtime 디렉토리로 복사 (최종 스테이지에 전달할 파일)
-RUN mkdir -p /runtime && \
-    cp -r /root/.vnc /runtime/ && \
-    cp -r ~/.xsession /runtime/ && \
-    cp -r ~/.xinitrc /runtime/ && \
-    cp -r /usr/share/novnc /runtime/novnc && \
-    mkdir -p /runtime/supervisor
-# supervisord.conf는 나중에 Final Stage에서 복사할 예정이므로 빌더 스테이지에선 생성하지 않아도 됩니다.
-
-# === Final Stage ===
+ARG JCODE_CODE_SERVER_BASE=ghcr.io/coder/code-server:4.135.0@sha256:ccd326184d71efc5ebb94155eda7bb30153902342a35dbc8525450d81aa55012
 FROM ${JCODE_CODE_SERVER_BASE}
-ARG JCODE_CODE_SERVER_BASE_DIGEST
-ARG JCODE_CODE_SERVER_REVISION
+ARG JCODE_CODE_SERVER_BASE_DIGEST=sha256:ccd326184d71efc5ebb94155eda7bb30153902342a35dbc8525450d81aa55012
+ARG JCODE_CODE_SERVER_REVISION=local
 
 LABEL org.opencontainers.image.title="code-server-vnc"
-LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc 환경 이미지"
+LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc environment"
 LABEL org.opencontainers.image.authors="OSLAB"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
 LABEL org.opencontainers.image.revision="${JCODE_CODE_SERVER_REVISION}"
 LABEL org.opencontainers.image.base.digest="${JCODE_CODE_SERVER_BASE_DIGEST}"
+LABEL org.opencontainers.image.base.version="4.135.0"
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 기본 Debian mirror를 사용한다.
-
-# 최종 이미지에서는 빌더에서 설정한 내용만 복사 (필요한 런타임 설정 파일)
-COPY --from=builder /runtime/ /runtime/
-
-# 최종 스테이지에서 필요한 패키지 설치
-# 여기서 netcat-openbsd는 nc 명령으로 포트 상태 체크에 필요하므로 반드시 설치해야 합니다.
-RUN apt-get update && apt-get install --no-install-recommends -y \
-    tigervnc-standalone-server \
-    tigervnc-tools \
-    x11-xserver-utils \
-    openbox \
-    novnc \
-    websockify \
-    python3 \
-    python3-pip \
-    python3-tk \
-    gcc \
-    gdb \
-    build-essential \
-    libc6-dev \
-    supervisor \
-    netcat-openbsd \
-    libxcb-icccm4 \
-    libxcb-image0 \
-    libxcb-keysyms1 \
-    libxcb-render-util0 \
-    libxcb-shape0 \
-    libxcb-xinerama0 \
-    libxcb-xkb1 \
-    libxkbcommon-x11-0 \
-    libxkbcommon0 \
-    fonts-nanum && \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install --no-install-recommends -y \
+      tigervnc-standalone-server \
+      tigervnc-tools \
+      x11-xserver-utils \
+      openbox \
+      novnc \
+      websockify \
+      python3 \
+      python3-pip \
+      python3-ipykernel \
+      python3-tk \
+      gcc \
+      gdb \
+      build-essential \
+      libc6-dev \
+      supervisor \
+      netcat-openbsd \
+      libxcb-icccm4 \
+      libxcb-image0 \
+      libxcb-keysyms1 \
+      libxcb-render-util0 \
+      libxcb-shape0 \
+      libxcb-xinerama0 \
+      libxcb-xkb1 \
+      libxkbcommon-x11-0 \
+      libxkbcommon0 \
+      fonts-nanum && \
     rm -rf /var/lib/apt/lists/*
 
-# coder 유저의 pip 설정 추가 (break-system-packages)
-RUN mkdir -p /home/coder/.config/pip && \
-    echo "[global]\n \
-        break-system-packages = true\n \
-        trusted-host = pypi.org\n \
-        index-url = https://pypi.org/simple\n\n \
-        [install]\n \
-        user = true" > /home/coder/.config/pip/pip.conf
+# Keep the VNC variant under the same no-AI policy as the browser IDE.
+RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
+    test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot
+
+RUN mkdir -p /home/coder/.config/pip \
+      /home/coder/.config/tigervnc \
+      /home/coder/.ipython/profile_default/startup \
+      /home/coder/.local/share/code-server \
+      /logs && \
+    printf '%s\n' '[global]' 'break-system-packages = true' \
+      'trusted-host = pypi.org' 'index-url = https://pypi.org/simple' \
+      '' '[install]' 'user = true' > /home/coder/.config/pip/pip.conf && \
+    printf '%s\n' 'exec openbox-session' > /home/coder/.config/tigervnc/xstartup && \
+    chmod +x /home/coder/.config/tigervnc/xstartup && \
+    cp /usr/share/novnc/vnc.html /usr/share/novnc/package.json && \
+    touch /home/coder/.Xauthority && \
+    chown -R 1000:1000 /home/coder /logs
 
 ENV PATH="${PATH}:/home/coder/.local/bin"
 
-# Jupyter 기본 패키지 설치 (가상환경 없이)
-RUN mkdir -p /home/coder/.ipython/profile_default/startup
-RUN pip3 install --upgrade pip --break-system-packages && \
-    pip3 install ipykernel --break-system-packages && \
-    python3 -m ipykernel install --user --name=python3 --display-name "Python 3 (System)"
-
-# 설정 파일들을 제 위치로 복사
-RUN cp -r /runtime/.vnc /home/coder/ && \
-    cp -r /runtime/.xsession /home/coder/ && \
-    cp -r /runtime/.xinitrc /home/coder/ && \
-    cp -r /runtime/novnc /usr/share/novnc && \
-    touch /home/coder/.Xauthority && \
-    mkdir -p /home/coder/.local/share/code-server && \
-    mkdir -p /logs && \
-    chown -R 1000:1000 /logs && \
-    chown -R 1000:1000 /home/coder && \
-    chown -R 1000:1000 /home/coder/.ipython/profile_default/startup
-
-# 환경별 비밀값이 없는 재현 가능한 기본 supervisor 설정
 COPY supervisor/supervisord.default.conf /etc/supervisor/supervisord.conf
 
-# UX guard only. The actual boundary is the Pod security context and NFS mount.
-COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
-RUN chmod 644 /etc/profile.d/restricted-shell.sh
-
-# 포트 개방 (code-server:8080, VNC:5900~5910, websockify(noVNC):6080~6100)
 EXPOSE 8080 5900-5910 6080-6100
 
-# supervisord를 통해 모든 서비스 실행 (nodaemon 옵션이 supervisord.conf에 설정되어 있음)
 ENTRYPOINT []
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]

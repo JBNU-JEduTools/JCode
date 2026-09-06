@@ -1,19 +1,14 @@
 # Stage 1: Build 단계 - 의존성 설치
-FROM python:3.9-slim AS builder
-
-# 빌드에 필요한 패키지 설치 (예: gcc, build-essential)
-RUN apt-get update && \
-    apt-get install -y gcc build-essential && \
-    rm -rf /var/lib/apt/lists/*
+FROM docker.io/library/python:3.9-slim AS builder
 
 WORKDIR /app
 
 # 의존성 파일 복사 및 설치 (설치 경로를 /install 하여 이후 복사)
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --only-binary=:all: --prefix=/install -r requirements.txt
 
 # Stage 2: 최종 이미지
-FROM python:3.9-slim
+FROM docker.io/library/python:3.9-slim
 
 # Kubernetes securityContext와 동일한 숫자 UID/GID를 사용한다.
 RUN groupadd --gid 1000 appuser && \

@@ -87,13 +87,14 @@ jobs:
             --tmpfs /home/coder/project:uid=1000,gid=1000 \
             "$ide_image" \
             --bind-addr 0.0.0.0:8080 --auth none \
-            --restrict-workspace-root /home/coder/project /home/coder/project
+            --disable-workspace-trust \
+            /home/coder/project
           docker run --detach --rm --name jcode-vnc-smoke \
             --user 1000:1000 \
             --publish 127.0.0.1:18081:8080 \
             --publish 127.0.0.1:16080:6080 \
             --tmpfs /home/coder/project:uid=1000,gid=1000 \
-            --env 'CODE_SERVER_EXTRA_ARGS=--restrict-workspace-root /home/coder/project /home/coder/project' \
+            --env 'CODE_SERVER_EXTRA_ARGS=--disable-workspace-trust /home/coder/project' \
             "$vnc_image"
           trap 'docker stop jcode-ide-smoke jcode-vnc-smoke' EXIT
           for port in 18080 18081; do

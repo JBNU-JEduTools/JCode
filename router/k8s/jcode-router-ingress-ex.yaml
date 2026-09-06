@@ -8,6 +8,10 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/enable-websockets: "true"
+    nginx.ingress.kubernetes.io/configuration-snippet: |-
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      # Preserve code-server's nonce-based Content-Security-Policy header.
 spec:
   ingressClassName: nginx
   tls:

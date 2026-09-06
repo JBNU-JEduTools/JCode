@@ -1,7 +1,7 @@
-ARG JCODE_CODE_SERVER_BASE
+ARG JCODE_CODE_SERVER_BASE=ghcr.io/coder/code-server:4.135.0@sha256:ccd326184d71efc5ebb94155eda7bb30153902342a35dbc8525450d81aa55012
 FROM ${JCODE_CODE_SERVER_BASE}
-ARG JCODE_CODE_SERVER_BASE_DIGEST
-ARG JCODE_CODE_SERVER_REVISION
+ARG JCODE_CODE_SERVER_BASE_DIGEST=sha256:ccd326184d71efc5ebb94155eda7bb30153902342a35dbc8525450d81aa55012
+ARG JCODE_CODE_SERVER_REVISION=local
 
 LABEL org.opencontainers.image.title="JCode IDE"
 LABEL org.opencontainers.image.description="JCode - 전북대학교 웹 IDE 플랫폼"
@@ -10,46 +10,35 @@ LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.source="https://github.com/mindungil/JCode-CodeServer"
 LABEL org.opencontainers.image.revision="${JCODE_CODE_SERVER_REVISION}"
 LABEL org.opencontainers.image.base.digest="${JCODE_CODE_SERVER_BASE_DIGEST}"
+LABEL org.opencontainers.image.base.version="4.135.0"
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 필요한 패키지 설치: gcc, python3, python3-pip
-RUN apt-get update && apt-get install --no-install-recommends -y \
-    gcc \
-    gdb \
-    build-essential \
-    libc6-dev \
-    python3 \
-    python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    if ! command -v gcc >/dev/null || ! command -v gdb >/dev/null || ! command -v python3 >/dev/null; then \
+      apt-get update && apt-get install --no-install-recommends -y \
+        gcc \
+        gdb \
+        build-essential \
+        libc6-dev \
+        python3 \
+        python3-pip && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
-# ===== JCode UI 커스터마이징 =====
-
-# 1. product.json 교체 (브랜딩: 이름, 텔레메트리 비활성화)
-COPY customization/product.json /usr/lib/code-server/lib/vscode/product.json
-
-# 2. workbench.html 교체 (커스텀 CSS 주입 포인트)
-COPY customization/workbench.html /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html
-
-# 3. 커스텀 CSS (Dracula 테마, 불필요한 UI 숨김)
-COPY customization/jcode.css /usr/lib/code-server/src/browser/media/jcode.css
-
-# 4. 워크스페이스 제한 쉘 스크립트
-COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
-RUN chmod 644 /etc/profile.d/restricted-shell.sh
-
-# 파일 권한 설정
-RUN chown -R 1000:1000 /usr/lib/code-server/lib/vscode/product.json \
-    /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html \
-    /usr/lib/code-server/src/browser/media/jcode.css
+# JCode does not provide AI coding assistants, including the extension bundled
+# with recent upstream VS Code releases.
+RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
+    test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot
 
 EXPOSE 8080
 
-# 기본 사용자 설정 (settings.json)
 USER coder
-RUN mkdir -p /home/coder/.local/share/code-server/User
-COPY customization/settings.json /home/coder/.local/share/code-server/User/settings.json
+WORKDIR /home/coder/project
 
-# code-server 실행
-CMD ["code-server", "--bind-addr", "0.0.0.0:8080", "--auth", "none", "--app-name", "JCode IDE", "--welcome-text", "JCode IDE에 오신 것을 환영합니다.", "--disable-getting-started-override", "--disable-workspace-trust"]
+# Keep the upstream workbench and settings intact. Kubernetes supplies the
+# workspace-specific arguments and mounts.
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/bin/code-server"]
+CMD ["--bind-addr", "0.0.0.0:8080", "--auth", "none", "/home/coder/project"]

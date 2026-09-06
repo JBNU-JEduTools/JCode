@@ -132,6 +132,18 @@ const cookieOptions = {
   maxAge: 6 * 3600 * 1000  
 };
 
+async function canAccessUserProfile(decoded, userProfile) {
+  const { sub, role } = decoded || {};
+  const { courseCode, clss, email } = userProfile || {};
+  if (!sub || !courseCode || !clss || !email) {
+    return false;
+  }
+  if (role === "ADMIN" || sub === email) {
+    return true;
+  }
+  return redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+}
+
 // 토큰 재발급 함수
 const refreshAccessToken = async (req, res, next, currentToken) => {
   try {
@@ -150,6 +162,7 @@ const refreshAccessToken = async (req, res, next, currentToken) => {
       // 새 access token
       res.cookie('jcodeAt', token, cookieOptions);
       req.cookies.jcodeAt = token;
+      req.user = jwt.verify(token, JWT_SECRET);
       
       // refresh token 재발급
       const setCookieHeader = response.headers['set-cookie'];
@@ -194,7 +207,7 @@ const ensureAuthenticated = (req, res, next) => {
         return refreshAccessToken(req, res, next, token);
       } else {
         // 서명 검증
-        jwt.verify(token, JWT_SECRET);
+        req.user = jwt.verify(token, JWT_SECRET);
         return next();
       }
     } else {
@@ -247,13 +260,9 @@ app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, n
     
     const { sub, role } = req.user;
     console.log(`course: ${courseCode}:${clss}, studentEmail: ${studentEmail}, email: ${sub}, role: ${role}`);
-    
-    // 권한 체크: ADMIN이 아닌 모든 유저는 Redis courseManagerList 또는 본인 이메일로 확인
-    if (!role || role !== "ADMIN") {
-      const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
-      if (!isManager && sub !== studentEmail) {
-        return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
-      }
+
+    if (!await canAccessUserProfile(req.user, userProfile)) {
+      return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
     }
     
     // targetUrl 조회
@@ -291,6 +300,12 @@ const resolveTargetUrlMiddleware = async (req, res, next) => {
         return closeWindowWithMessage(res, 404, "사용자 정보를 찾을 수 없습니다. 다시 시도해주세요.");
       }
       const { courseCode, clss, email } = userProfile;
+      if (!courseCode || !clss || !email) {
+        return closeWindowWithMessage(res, 400, "필수 프로젝트 정보가 누락되었습니다.");
+      }
+      if (!await canAccessUserProfile(req.user, userProfile)) {
+        return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
+      }
       const redisKeyForTarget = (userProfile.snapshot === 'true' || userProfile.snapshot === true)
         ? `user:${email}:course:${courseCode}:${clss}:snapshot`
         : `user:${email}:course:${courseCode}:${clss}`;
@@ -401,8 +416,9 @@ server.on('upgrade', async (req, socket, head) => {
       socket.destroy();
       return;
     }
+    let decoded;
     try {
-      jwt.verify(token, JWT_SECRET);
+      decoded = jwt.verify(token, JWT_SECRET);
     } catch (err) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\nInvalid access token');
       socket.destroy();
@@ -423,16 +439,10 @@ server.on('upgrade', async (req, socket, head) => {
     }
     const { courseCode, clss, email, snapshot } = userProfile;
 
-    // 권한 체크: GET /jcode와 동일한 로직 적용
-    const decoded = jwt.decode(token);
-    const { sub, role } = decoded;
-    if (!role || role !== "ADMIN") {
-      const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
-      if (!isManager && sub !== email) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\nNo permission for this project');
-        socket.destroy();
-        return;
-      }
+    if (!await canAccessUserProfile(decoded, userProfile)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\nNo permission for this project');
+      socket.destroy();
+      return;
     }
 
     const redisKeyForTarget = (snapshot === 'true' || snapshot === true)

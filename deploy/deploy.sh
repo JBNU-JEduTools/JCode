@@ -174,7 +174,7 @@ jq -n \
   --arg workspace_proxy_url "$workspace_proxy_url" \
   --arg watcher_namespace "$watcher_namespace" \
   --arg workspace_proxy_namespace "$workspace_proxy_namespace" \
-  '{data:{HARBOR_REGISTRY:$harbor_registry,CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WORKSPACE_RESOURCE_PROFILES_JSON:$workspace_resource_profiles_json,WORKSPACE_PROXY_URL:$workspace_proxy_url,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000"}}' \
+  '{data:{HARBOR_REGISTRY:$harbor_registry,CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WORKSPACE_RESOURCE_PROFILES_JSON:$workspace_resource_profiles_json,WORKSPACE_PROXY_URL:$workspace_proxy_url,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000",WORKSPACE_EXTENSIONS_DIR:"extensions-v2"}}' \
   > "$config_patch"
 kubectl patch configmap "$generator_configmap" -n "$namespace" --type=merge --patch-file "$config_patch"
 kubectl apply -f "$render_dir/platform.yaml"

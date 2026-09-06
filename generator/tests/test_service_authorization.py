@@ -115,8 +115,8 @@ def test_namespace_api_preserves_conflict_for_namespace_owned_by_another_course(
             )
 
     def init_with_existing_owner(core_v1_api, *args):
-        namespace = args[-3]
-        course_id = args[-2]
+        namespace = args[4]
+        course_id = args[5]
         generator.ensure_course_metadata(core_v1_api, namespace, course_id)
 
     monkeypatch.setattr(generator.client, "CoreV1Api", ExistingCourseMetadata)
@@ -266,3 +266,25 @@ def test_missing_namespace_is_confirmed_deleted(generator, monkeypatch):
     response = asyncio.run(generator.delete_namespace_api("jcode-os-1", 11, {}))
 
     assert response["deleted"] is True
+
+
+def test_jcode_delete_is_idempotent_when_namespace_is_missing(generator, monkeypatch):
+    class MissingNamespace:
+        def read_namespace(self, name):
+            raise generator.ApiException(status=404)
+
+        def read_namespaced_config_map(self, name, namespace):
+            raise AssertionError("missing namespace must not require a namespaced permission check")
+
+    monkeypatch.setattr(generator.client, "CoreV1Api", MissingNamespace)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: object())
+    request = generator.DeleteRequest(
+        course_id=11,
+        namespace="jcode-os-1",
+        deployment_name="jcode-os-1-20260001",
+        service_name="jcode-os-1-20260001-svc",
+    )
+
+    response = asyncio.run(generator.delete_resources(request, {}))
+
+    assert "이미 없습니다" in response["msg"]
