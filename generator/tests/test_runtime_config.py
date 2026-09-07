@@ -130,27 +130,71 @@ def test_existing_workspace_deployment_is_reconciled(generator, monkeypatch):
     ) is True
 
 
+def test_existing_workspace_service_is_reconciled_without_cluster_ip(generator):
+    class CoreV1:
+        def __init__(self):
+            self.patch = None
+
+        def create_namespaced_service(self, namespace, body):
+            raise generator.ApiException(status=409)
+
+        def patch_namespaced_service(self, name, namespace, body):
+            self.patch = body
+
+    core = CoreV1()
+    result = generator.create_service(core, "jcode-alg-1", "workspace-svc", "workspace", True)
+
+    assert result == "Service 'workspace-svc' 갱신 완료"
+    assert core.patch[0]["value"] == {"app": "workspace"}
+    assert [port["port"] for port in core.patch[1]["value"]] == [8080, 5901, 6080]
+
+
+def runtime_namespace_core(endpoints=None, service=None):
+    namespace = SimpleNamespace(
+        metadata=SimpleNamespace(
+            labels={"jcode.io/environment": "prod"},
+            annotations={"jcode.io/environment": "prod"},
+        )
+    )
+    metadata = SimpleNamespace(data={
+        "course-id": "1",
+        "namespace": "jcode-alg-1",
+        "environment": "prod",
+    })
+    ready_service = service or SimpleNamespace(
+        spec=SimpleNamespace(
+            selector={"app": "workspace"},
+            ports=[SimpleNamespace(port=8080)],
+        )
+    )
+    ready_endpoints = endpoints or SimpleNamespace(
+        subsets=[SimpleNamespace(addresses=[SimpleNamespace(ip="10.0.0.1")])]
+    )
+    return SimpleNamespace(
+        read_namespace=lambda **_: namespace,
+        read_namespaced_config_map=lambda **_: metadata,
+        read_namespaced_service=lambda *_: ready_service,
+        read_namespaced_endpoints=lambda *_: ready_endpoints,
+    )
+
+
 def test_jcode_status_requires_deployment_and_service_endpoint(generator, monkeypatch):
     deployment = SimpleNamespace(
         metadata=SimpleNamespace(generation=3),
-        spec=SimpleNamespace(replicas=1),
+        spec=SimpleNamespace(replicas=1, selector=SimpleNamespace(match_labels={"app": "workspace"})),
         status=SimpleNamespace(
             conditions=[],
             observed_generation=3,
+            replicas=1,
             updated_replicas=1,
             available_replicas=1,
             ready_replicas=1,
         ),
     )
-    core = SimpleNamespace(
-        read_namespaced_endpoints=lambda *_: SimpleNamespace(
-            subsets=[SimpleNamespace(addresses=[SimpleNamespace(ip="10.0.0.1")])]
-        )
-    )
+    core = runtime_namespace_core()
     apps = SimpleNamespace(read_namespaced_deployment=lambda *_: deployment)
     monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
     monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
-    monkeypatch.setattr(generator, "verify_course_namespace", lambda *_: None)
 
     result = asyncio.run(generator.get_jcode_status(
         1,
@@ -175,11 +219,10 @@ def test_jcode_status_reports_progress_deadline_failure(generator, monkeypatch):
             )],
         ),
     )
-    core = SimpleNamespace()
+    core = runtime_namespace_core()
     apps = SimpleNamespace(read_namespaced_deployment=lambda *_: deployment)
     monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
     monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
-    monkeypatch.setattr(generator, "verify_course_namespace", lambda *_: None)
 
     result = asyncio.run(generator.get_jcode_status(
         1,
@@ -190,6 +233,50 @@ def test_jcode_status_reports_progress_deadline_failure(generator, monkeypatch):
     ))
 
     assert result == {"state": "FAILED", "reasonCode": "DEPLOYMENT_PROGRESS_DEADLINE"}
+
+
+@pytest.mark.parametrize(
+    ("missing_resource", "expected"),
+    [
+        ("namespace", {"state": "MISSING", "reasonCode": "NAMESPACE_MISSING"}),
+        ("deployment", {"state": "MISSING", "reasonCode": "DEPLOYMENT_MISSING"}),
+        ("service", {"state": "MISSING", "reasonCode": "SERVICE_MISSING"}),
+        ("endpoints", {"state": "NOT_READY", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}),
+    ],
+)
+def test_jcode_status_distinguishes_missing_resources(generator, monkeypatch, missing_resource, expected):
+    deployment = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(replicas=1, selector=SimpleNamespace(match_labels={"app": "workspace"})),
+        status=SimpleNamespace(
+            conditions=[], observed_generation=1, replicas=1, updated_replicas=1,
+            available_replicas=1, ready_replicas=1,
+        ),
+    )
+    core = runtime_namespace_core()
+
+    def missing(*args, **kwargs):
+        raise generator.ApiException(status=404)
+
+    if missing_resource == "namespace":
+        core.read_namespace = missing
+    elif missing_resource == "deployment":
+        deployment = None
+    elif missing_resource == "service":
+        core.read_namespaced_service = missing
+    else:
+        core.read_namespaced_endpoints = missing
+
+    apps = SimpleNamespace(
+        read_namespaced_deployment=missing if deployment is None else lambda *_: deployment
+    )
+    monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
+
+    result = asyncio.run(generator.get_jcode_status(
+        1, "jcode-alg-1", "workspace", "workspace-svc", {}
+    ))
+    assert result == expected
 
 
 def test_workspace_images_must_use_immutable_harbor_reference(generator, monkeypatch):

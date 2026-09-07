@@ -18,6 +18,7 @@ printf '\n' >> "$MOCK_LOG"
 
 if [[ ${MOCK_MODE:-} == storage ]]; then
   if [[ $1 == wait && $2 == -n ]]; then
+    printf 'persistentvolumeclaim/mock condition met\n'
     exit 0
   fi
   if [[ $1 == get && $2 == pvc ]]; then
@@ -202,6 +203,8 @@ JCODE_NAMESPACE=watcher GENERATOR_CONFIGMAP_NAME=jcode-generator-configmap \
 jq -e '
   .data.NFS_SERVER == "10.233.9.148" and
   .data.NFS_PATH == "/pvc-11111111-2222-3333-4444-555555555555" and
+  .data.SNAPSHOT_NFS_SERVER == "10.233.9.148" and
+  .data.SNAPSHOT_NFS_PATH == "/pvc-11111111-2222-3333-4444-555555555555" and
   .data.NFS_MOUNT_PATH == "/nfs-data" and
   .data.WORKSPACE_EXTENSIONS_DIR == "extensions-v2"
 ' "$storage_patch" >/dev/null

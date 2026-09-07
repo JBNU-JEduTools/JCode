@@ -1,0 +1,179 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-ha-scripts
+  labels:
+    app.kubernetes.io/part-of: jcode
+data:
+  start-redis.sh: |
+    #!/bin/sh
+    set -eu
+
+    config=/data/redis.conf
+    if [ ! -s "$config" ]; then
+      cat > "$config" <<'EOF'
+    bind 0.0.0.0
+    protected-mode yes
+    port 6379
+    dir /data
+    save 900 1 300 10 60 10000
+    appendonly yes
+    appendfsync everysec
+    aof-use-rdb-preamble yes
+    replica-read-only yes
+    EOF
+      if [ "$HOSTNAME" != "redis-ha-0" ]; then
+        echo "replicaof redis-ha-0.redis-headless.watcher.svc.cluster.local 6379" >> "$config"
+      fi
+    fi
+
+    exec redis-server "$config" \
+      --requirepass "$REDIS_PASSWORD" \
+      --masterauth "$REDIS_PASSWORD" \
+      --replica-announce-ip "$HOSTNAME.redis-headless.watcher.svc.cluster.local" \
+      --replica-announce-port 6379
+  start-sentinel.sh: |
+    #!/bin/sh
+    set -eu
+
+    config=/data/sentinel.conf
+    if [ ! -s "$config" ]; then
+      cat > "$config" <<'EOF'
+    bind 0.0.0.0
+    protected-mode yes
+    port 26379
+    dir /data
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor jcode redis-ha-0.redis-headless.watcher.svc.cluster.local 6379 2
+    sentinel down-after-milliseconds jcode 5000
+    sentinel failover-timeout jcode 60000
+    sentinel parallel-syncs jcode 1
+    EOF
+      printf 'sentinel auth-pass jcode %s\n' "$REDIS_PASSWORD" >> "$config"
+    fi
+
+    exec redis-server "$config" --sentinel \
+      --requirepass "$REDIS_PASSWORD" \
+      --sentinel announce-ip "$HOSTNAME.redis-sentinel-headless.watcher.svc.cluster.local" \
+      --sentinel announce-port 26379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  labels:
+    app: redis-ha
+    app.kubernetes.io/part-of: jcode
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis-ha
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-ha
+  labels:
+    app: redis-ha
+    app.kubernetes.io/part-of: jcode
+spec:
+  serviceName: redis-headless
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redis-ha
+  template:
+    metadata:
+      labels:
+        app: redis-ha
+    spec:
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: redis-ha
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command: [/scripts/start-redis.sh]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: jcode-redis-secret
+                  key: REDIS_PASSWORD
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            exec:
+              command: [sh, -ec, 'exec redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping']
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: [sh, -ec, 'exec redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping']
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [sh, -ec, 'exec redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping']
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: scripts
+          configMap:
+            name: redis-ha-scripts
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn-r2-retain
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-ha-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: redis-ha

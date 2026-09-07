@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+
+target=/etc/ssl/jedutools/haproxy-combined.pem
+previous=${target}.previous
+incoming=$(mktemp)
+trap 'rm -f "$incoming"' EXIT
+umask 077
+cat > "$incoming"
+
+openssl x509 -in "$incoming" -noout >/dev/null
+openssl pkey -in "$incoming" -noout >/dev/null
+openssl x509 -in "$incoming" -checkend 86400 -noout >/dev/null
+subject_alt_names=$(openssl x509 -in "$incoming" -noout -ext subjectAltName)
+printf '%s\n' "$subject_alt_names" | grep -Fq 'DNS:*.jedutools.io'
+printf '%s\n' "$subject_alt_names" | grep -Fq 'DNS:jedutools.io'
+cert_key=$(openssl x509 -in "$incoming" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+private_key=$(openssl pkey -in "$incoming" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+[ "$cert_key" = "$private_key" ]
+
+if [ -f "$target" ] && cmp -s "$incoming" "$target"; then
+  exit 0
+fi
+
+if [ -f "$target" ]; then
+  install -m 0600 -o root -g root "$target" "$previous"
+fi
+install -m 0600 -o root -g root "$incoming" "$target"
+
+if ! haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null; then
+  [ -f "$previous" ] && install -m 0600 -o root -g root "$previous" "$target"
+  exit 1
+fi
+if ! systemctl reload haproxy; then
+  [ -f "$previous" ] && install -m 0600 -o root -g root "$previous" "$target"
+  systemctl reload haproxy || true
+  exit 1
+fi
+systemctl is-active --quiet haproxy

@@ -1,0 +1,8 @@
+[Unit]
+Description=Synchronize the jedutools.io certificate to both HAProxy nodes
+After=network-online.target haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/deploy-jedutools-cert /etc/letsencrypt/live/jedutools.io

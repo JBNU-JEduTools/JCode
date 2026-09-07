@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: watcher
+resources:
+  - storage-classes.yaml
+  - configmaps.yaml
+  - storage.yaml
+  - redis.yaml
+  - redis-sentinel.yaml
+  - watcher-postgres.yaml

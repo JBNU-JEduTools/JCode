@@ -78,7 +78,7 @@ verify_cronjob_image "$jcode_namespace" jcode-archive-cleanup cleanup "$registry
 verify_workload deployment "$jcode_namespace" jcode-router jcode-router "$registry/jcode-router" "$(digest_for router)"
 verify_workload deployment "$jcode_namespace" squid-exporter squid-exporter "$registry/squid-exporter" "$(digest_for squid_exporter)"
 verify_workload deployment "$watcher_namespace" watcher-backend watcher-backend "$registry/watcher-backend" "$(digest_for watcher_backend)"
-verify_workload daemonset "$watcher_namespace" watcher-filemon watcher-filemon "$registry/watcher-filemon" "$(digest_for watcher_filemon)"
+verify_workload deployment "$watcher_namespace" watcher-filemon watcher-filemon "$registry/watcher-filemon" "$(digest_for watcher_filemon)"
 verify_workload daemonset "$watcher_namespace" watcher-procmon watcher-procmon "$registry/watcher-procmon" "$(digest_for watcher_procmon)"
 verify_workload deployment "${BACKEND_NAMESPACE:?BACKEND_NAMESPACE is required}" "${BACKEND_DEPLOYMENT:?BACKEND_DEPLOYMENT is required}" "${BACKEND_CONTAINER:?BACKEND_CONTAINER is required}" "$registry/jcode-backend" "$(digest_for backend)"
 verify_workload deployment "${FRONTEND_NAMESPACE:?FRONTEND_NAMESPACE is required}" "${FRONTEND_DEPLOYMENT:?FRONTEND_DEPLOYMENT is required}" "${FRONTEND_CONTAINER:?FRONTEND_CONTAINER is required}" "$registry/jcode-front" "$(digest_for frontend)"

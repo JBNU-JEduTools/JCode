@@ -1,0 +1,31 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: watcher-postgres
+  labels:
+    app.kubernetes.io/environment: production
+    app.kubernetes.io/name: watcher-postgres
+    app.kubernetes.io/part-of: jcode-watcher
+spec:
+  description: JCode Watcher production PostgreSQL
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  instances: 2
+  primaryUpdateMethod: switchover
+  affinity:
+    nodeSelector:
+      kubernetes.io/os: linux
+    podAntiAffinityType: required
+  bootstrap:
+    initdb:
+      database: watcher
+      owner: watcher
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  storage:
+    size: 20Gi
+    storageClass: longhorn-r2-retain

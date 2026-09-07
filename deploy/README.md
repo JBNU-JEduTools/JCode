@@ -2,6 +2,9 @@
 
 `deploy/cluster`에는 기존 운영 권한과 충돌하지 않는 v2 ClusterRole과 AdmissionPolicy가 있습니다.
 `deploy/base`에는 Generator, Bootstrap, Router, Squid Exporter의 공통 리소스가 있습니다.
+`deploy/production-state`에는 운영 복구에 필요한 비밀값 제외 ConfigMap, PVC 규격,
+Redis 리소스와 복구 순서가 있습니다. 이 디렉터리는 컨트롤러 배포와 분리해서
+명시적으로 적용합니다.
 환경 차이는 다음 overlay에서만 관리합니다.
 
 - `deploy/overlays/dev`: `dev`, 단일 replica, dev node 배치, HPA 없음
@@ -27,6 +30,8 @@ dev overlay는 기존 `jcode-generator-dev-*`, `jcode-router-dev-*` ConfigMap과
 ## 수동 배포 순서
 
 수동 배포도 자동 배포와 같은 commit의 이미지 digest를 사용하며 production에서 이미지를 다시 만들지 않습니다.
+현재 production에 적용된 revision과 digest는
+`deploy/releases/production-current.json`에 기록합니다.
 
 1. Harbor에서 배포할 commit SHA와 이미지 digest를 확인합니다.
 
@@ -144,8 +149,11 @@ production 기능 검증 대상은 release 실행 시 `smoke_course_namespace`�
 
 ```bash
 install -m 0755 deploy/tools/kubectl-courses /usr/local/bin/kubectl-courses
-k courses --env prod
-k courses --env dev
+test ! -L /usr/local/bin/k || unlink /usr/local/bin/k
+install -m 0755 deploy/tools/k /usr/local/bin/k
+k get courses             # production
+k get courses --env dev   # dev
+k get courses -A          # all
 ```
 
 ## 렌더링

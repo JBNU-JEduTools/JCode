@@ -14,6 +14,7 @@ router/squid/squid.conf
 router/supervisor/supervisord.conf
 router/supervisord/
 router/*.tar
+router/node_modules/
 
 ### k8s manifest ###
 /k8s/

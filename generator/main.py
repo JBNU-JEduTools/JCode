@@ -1436,10 +1436,33 @@ def create_service(core_v1_api, namespace: str, service_name: str, app_label: st
         logger.info(f"Service '{service_name}' 생성 완료")
         return f"Service '{service_name}' 생성 완료"
     except ApiException as e:
-        logger.exception("Service 생성 중 오류:")
         if e.status == 409:
-            return f"Service '{service_name}'가 이미 존재합니다."
+            # clusterIP/nodePort 같은 API 서버 할당 값은 건드리지 않고,
+            # Controller가 소유하는 selector와 port만 desired state로 되돌린다.
+            core_v1_api.patch_namespaced_service(
+                name=service_name,
+                namespace=namespace,
+                body=[
+                    {"op": "add", "path": "/spec/selector", "value": {"app": app_label}},
+                    {
+                        "op": "add",
+                        "path": "/spec/ports",
+                        "value": [
+                            {
+                                "name": port.name,
+                                "protocol": port.protocol,
+                                "port": port.port,
+                                "targetPort": port.target_port,
+                            }
+                            for port in service_ports
+                        ],
+                    },
+                ],
+            )
+            logger.info(f"Service '{service_name}' 갱신 완료")
+            return f"Service '{service_name}' 갱신 완료"
         else:
+            logger.exception("Service 생성 중 오류:")
             raise Exception(f"Service 생성 중 오류: {e}")
         
 def delete_deployment(apps_v1_api, namespace: str, deployment_name: str) -> str:
@@ -2350,13 +2373,43 @@ async def get_jcode_status(
     service_name = validate_resource_name(service_name)
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
-    verify_course_namespace(core_v1_api, namespace, course_id)
+    try:
+        namespace_object = core_v1_api.read_namespace(name=namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "MISSING", "reasonCode": "NAMESPACE_MISSING"}
+        raise
+
+    labels = namespace_object.metadata.labels or {}
+    annotations = namespace_object.metadata.annotations or {}
+    if (
+        labels.get("jcode.io/environment") != JCODE_ENVIRONMENT
+        or annotations.get("jcode.io/environment") != JCODE_ENVIRONMENT
+    ):
+        return {"state": "DRIFTED", "reasonCode": "NAMESPACE_UNMANAGED"}
+
+    try:
+        metadata = core_v1_api.read_namespaced_config_map(
+            name="jcode-course-metadata",
+            namespace=namespace,
+        )
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "DRIFTED", "reasonCode": "NAMESPACE_UNMANAGED"}
+        raise
+    values = metadata.data or {}
+    if (
+        values.get("course-id") != str(course_id)
+        or values.get("namespace") != namespace
+        or (values.get("environment") is not None and values.get("environment") != JCODE_ENVIRONMENT)
+    ):
+        return {"state": "DRIFTED", "reasonCode": "NAMESPACE_OWNERSHIP_MISMATCH"}
 
     try:
         deployment = apps_v1_api.read_namespaced_deployment(deployment_name, namespace)
     except ApiException as error:
         if error.status == 404:
-            return {"state": "PENDING", "reasonCode": "DEPLOYMENT_PENDING"}
+            return {"state": "MISSING", "reasonCode": "DEPLOYMENT_MISSING"}
         raise
 
     conditions = deployment.status.conditions or []
@@ -2371,22 +2424,36 @@ async def get_jcode_status(
     desired = deployment.spec.replicas or 1
     deployment_ready = (
         (deployment.status.observed_generation or 0) >= (deployment.metadata.generation or 0)
-        and (deployment.status.updated_replicas or 0) >= desired
-        and (deployment.status.available_replicas or 0) >= desired
-        and (deployment.status.ready_replicas or 0) >= desired
+        and (deployment.status.replicas or 0) == desired
+        and (deployment.status.updated_replicas or 0) == desired
+        and (deployment.status.available_replicas or 0) == desired
+        and (deployment.status.ready_replicas or 0) == desired
     )
     if not deployment_ready:
-        return {"state": "PENDING", "reasonCode": "DEPLOYMENT_NOT_READY"}
+        return {"state": "NOT_READY", "reasonCode": "DEPLOYMENT_NOT_READY"}
+
+    try:
+        service = core_v1_api.read_namespaced_service(service_name, namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "MISSING", "reasonCode": "SERVICE_MISSING"}
+        raise
+
+    deployment_selector = (deployment.spec.selector.match_labels or {})
+    service_selector = service.spec.selector or {}
+    service_ports = service.spec.ports or []
+    if service_selector != deployment_selector or not any(port.port == 8080 for port in service_ports):
+        return {"state": "DRIFTED", "reasonCode": "SERVICE_SPEC_DRIFT"}
 
     try:
         endpoints = core_v1_api.read_namespaced_endpoints(service_name, namespace)
     except ApiException as error:
         if error.status == 404:
-            return {"state": "PENDING", "reasonCode": "SERVICE_ENDPOINT_PENDING"}
+            return {"state": "NOT_READY", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}
         raise
     endpoint_ready = any(subset.addresses for subset in (endpoints.subsets or []))
     if not endpoint_ready:
-        return {"state": "PENDING", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}
+        return {"state": "NOT_READY", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}
 
     return {
         "state": "READY",
