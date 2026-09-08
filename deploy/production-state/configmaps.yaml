@@ -112,8 +112,8 @@ metadata:
   name: jcode-generator-configmap
 data:
   ALGORITHM: "HS256"
-  CODE_SERVER_IMAGE: "harbor.jedutools.io/jdevops/code-server@sha256:3b740d8491c98af120ad83e3fbb42425141cd2c2693cc84b6f6065178c17b58b"
-  CODE_SERVER_VNC_IMAGE: "harbor.jedutools.io/jdevops/code-server-vnc@sha256:ddeeb7794a2ff467069e4281b66d09e1a67a04a7ba106263e6553445af109ed9"
+  CODE_SERVER_IMAGE: "harbor.jedutools.io/jdevops/code-server@sha256:1dc68fed3abcfdb21a8d76f58770dbb5c9568e1f7ca634f94277024c18f5d19e"
+  CODE_SERVER_VNC_IMAGE: "harbor.jedutools.io/jdevops/code-server-vnc@sha256:eb4949cda6eb3cb16a7c69fc8e0336ffa1ffcf8aa80c0fd67da53aff2acb9415"
   EXTERNAL_SECRET_STORE_KIND: "ClusterSecretStore"
   EXTERNAL_SECRET_STORE_NAME: "jcode-harbor-pull-secret"
   HARBOR_REGISTRY: "harbor.jedutools.io"
@@ -133,7 +133,7 @@ data:
   WATCHER_NAMESPACE: "watcher"
   WORKSPACE_DNS_CIDRS: "169.254.25.10/32"
   WORKSPACE_EXTENSIONS_DIR: "extensions-v2"
-  WORKSPACE_INIT_IMAGE: "harbor.jedutools.io/jdevops/workspace-init@sha256:aadcea977014b52c18bef4f7e16940458a7ac244ae94acfc2b864369b37c2ba3"
+  WORKSPACE_INIT_IMAGE: "harbor.jedutools.io/jdevops/workspace-init@sha256:9fa64bcfd128354f136a503c99104021020d3a0c8bc8de58f64e77d3ecb2eb5d"
   WORKSPACE_NO_PROXY: "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local"
   WORKSPACE_PROXY_NAMESPACE: "watcher"
   WORKSPACE_PROXY_POD_LABEL: "jcode-router"

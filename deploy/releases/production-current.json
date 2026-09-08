@@ -1,25 +1,25 @@
 {
   "schema": 3,
   "environment": "production",
-  "capturedAt": "2026-09-08T18:04:15+09:00",
+  "capturedAt": "2026-09-08T19:41:54+09:00",
   "revisions": {
-    "jcode": "de684df3484e6ef8cb7b9ab0d1398b769589ce5b",
-    "backend": "527077a400955e1c83271a505f6944ddbcf5da7f",
-    "frontend": "bd5fab9bd9cf80b7e2bd43d7d30eb4bd4987178a",
-    "watcher": "0eae8f3e5f73fcc9e9da8fbb7d2b3c313568d932",
-    "code_server": "ff61ac44b9f774bf436f7277fb26bb74287d4879"
+    "jcode": "64a4cf0fc63511ac15d3ce3e83c1358634473318",
+    "backend": "b0739c067a5ed76a913f2e6e4409ac45fa365799",
+    "frontend": "aecd5529f83b0918c32b8678daf15e7f9bf0d376",
+    "watcher": "d9516a2038624edfdbe97c14204ab98e88e78409",
+    "code_server": "64a4cf0fc63511ac15d3ce3e83c1358634473318"
   },
   "digests": {
-    "watcher_backend": "sha256:89264b5ca753f18be420d8dd2b0407ab2a2d85a2f44e38689ae8e75f45aa8895",
-    "watcher_filemon": "sha256:c97f04f10c84b777c860607e50b4f0f0fc53ee9c01f0042a9b8d376b6133b6a7",
-    "watcher_procmon": "sha256:c343e1a22ea513e82821cebdad64af1640b5b9c2dddc14e06306b20e145b5c78",
-    "generator": "sha256:de5bd3ddfdc2ee2340bc22682341f4d83c8d94499af427731b133a8ef0a5ec08",
-    "router": "sha256:98d0d99c910174fa2a7833d858d82f494fb25bbaf82bf01fb8a816b29154f805",
-    "code_server": "sha256:3b740d8491c98af120ad83e3fbb42425141cd2c2693cc84b6f6065178c17b58b",
-    "code_server_vnc": "sha256:ddeeb7794a2ff467069e4281b66d09e1a67a04a7ba106263e6553445af109ed9",
-    "workspace_init": "sha256:aadcea977014b52c18bef4f7e16940458a7ac244ae94acfc2b864369b37c2ba3",
-    "squid_exporter": "sha256:0bc67ca1ccde0d7d227c4ffbeae9963355277fceacfbcd96308191f29fd02649",
-    "backend": "sha256:36ee318e9c20dc87bb7d853fb131e82b567deb1f42f2aa919e4a9ce380c5149b",
-    "frontend": "sha256:ef317e0c30ed6a43c62fbfa8d1c8074f65fbb819cfff210e3f4ec312d40e2f84"
+    "watcher_backend": "sha256:3f5dd7f975445fdfa62be1d74ecc7f86e4885e5fdfebf939d6258d1b627dfd85",
+    "watcher_filemon": "sha256:8ef96f9d751bda1b730886d93330deedb2c85c99fa986a4b2bc297254a1f586a",
+    "watcher_procmon": "sha256:01e5822fc6c208af6a64ad867a23583ccf855df7aa5b25f5c80b5462afc5a959",
+    "generator": "sha256:a08b4c2b80665fe2ecb70028069704deeabb1b765827886875601b1b85e45b37",
+    "router": "sha256:95ef85283b6f3c2719e25c1234d93099f732e5e3f518263dddbd045b831938b4",
+    "code_server": "sha256:1dc68fed3abcfdb21a8d76f58770dbb5c9568e1f7ca634f94277024c18f5d19e",
+    "code_server_vnc": "sha256:eb4949cda6eb3cb16a7c69fc8e0336ffa1ffcf8aa80c0fd67da53aff2acb9415",
+    "workspace_init": "sha256:9fa64bcfd128354f136a503c99104021020d3a0c8bc8de58f64e77d3ecb2eb5d",
+    "squid_exporter": "sha256:25a02336c1242e00dc26106d32964b1cf3a91bae380fd84ea48fc742bf509213",
+    "backend": "sha256:14d1aa35302960b866063f8903606b019ec100a25bc4b5ddef1d4040b8af28a0",
+    "frontend": "sha256:58e052e1502cab6bd9dfb383b39b515cd4a82466af70553eb76736dbe54749d5"
   }
 }
