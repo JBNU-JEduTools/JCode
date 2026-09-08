@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${KUBECONFIG:-}" ]]; then
+  for config in /home/ubuntu/.kube/config "$HOME/.kube/config"; do
+    if [[ -r "$config" ]]; then
+      export KUBECONFIG=$config
+      break
+    fi
+  done
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" =~ ^courses?$ ]]; then
+  shift 2
+
+  case "${1:-}" in
+    "")
+      exec kubectl courses --env prod
+      ;;
+    -A|--all-namespaces|all)
+      shift
+      exec kubectl courses "$@"
+      ;;
+    dev|prod)
+      environment=$1
+      shift
+      exec kubectl courses --env "$environment" "$@"
+      ;;
+    --env|-h|--help)
+      exec kubectl courses "$@"
+      ;;
+    *)
+      exec kubectl courses --env prod "$@"
+      ;;
+  esac
+fi
+
+exec kubectl "$@"

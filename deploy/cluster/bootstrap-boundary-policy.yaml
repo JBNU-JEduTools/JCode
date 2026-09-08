@@ -1,0 +1,114 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jcode-bootstrap-resources-v2
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["serviceaccounts", "limitranges", "configmaps"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["rolebindings"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["networkpolicies"]
+      - apiGroups: ["external-secrets.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["externalsecrets"]
+  matchConditions:
+    - name: v2-bootstrap-service-account
+      expression: >-
+        request.userInfo.username in ['system:serviceaccount:dev:jcode-bootstrap-v2', 'system:serviceaccount:watcher:jcode-bootstrap-v2']
+  validations:
+    - expression: >-
+        request.userInfo.username == 'system:serviceaccount:dev:jcode-bootstrap-v2'
+          ? (request.operation == 'DELETE' ? oldObject.metadata.namespace : object.metadata.namespace).startsWith('jcode-dev-')
+          : ((request.operation == 'DELETE' ? oldObject.metadata.namespace : object.metadata.namespace).startsWith('jcode-') && !(request.operation == 'DELETE' ? oldObject.metadata.namespace : object.metadata.namespace).startsWith('jcode-dev-'))
+      message: Bootstrap v2는 해당 환경의 course namespace만 변경할 수 있습니다.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jcode-bootstrap-resources-v2
+spec:
+  policyName: jcode-bootstrap-resources-v2
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jcode-bootstrap-namespaces-v2
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: v2-bootstrap-service-account
+      expression: >-
+        request.userInfo.username in ['system:serviceaccount:dev:jcode-bootstrap-v2', 'system:serviceaccount:watcher:jcode-bootstrap-v2']
+  validations:
+    - expression: >-
+        request.userInfo.username == 'system:serviceaccount:dev:jcode-bootstrap-v2'
+          ? (request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name).startsWith('jcode-dev-')
+          : ((request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name).startsWith('jcode-') && !(request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name).startsWith('jcode-dev-'))
+      message: Bootstrap v2는 해당 환경의 course namespace만 관리할 수 있습니다.
+    - expression: >-
+        request.operation == 'DELETE' || (has(object.metadata.labels) && has(object.metadata.annotations) && 'jcode.io/course-id' in object.metadata.labels && 'jcode.io/course-id' in object.metadata.annotations && object.metadata.labels['jcode.io/course-id'] == object.metadata.annotations['jcode.io/course-id'] && 'jcode.io/environment' in object.metadata.labels && 'jcode.io/environment' in object.metadata.annotations && object.metadata.labels['jcode.io/environment'] == object.metadata.annotations['jcode.io/environment'] && object.metadata.labels['jcode.io/environment'] == (request.userInfo.username == 'system:serviceaccount:dev:jcode-bootstrap-v2' ? 'dev' : 'prod'))
+      message: namespace에는 일치하는 course-id와 environment metadata가 필요합니다.
+    - expression: >-
+        request.operation != 'UPDATE' || ((!has(oldObject.metadata.annotations) || !('jcode.io/course-id' in oldObject.metadata.annotations) || oldObject.metadata.annotations['jcode.io/course-id'] == object.metadata.annotations['jcode.io/course-id']) && (!has(oldObject.metadata.annotations) || !('jcode.io/environment' in oldObject.metadata.annotations) || oldObject.metadata.annotations['jcode.io/environment'] == object.metadata.annotations['jcode.io/environment']))
+      message: namespace의 course-id와 environment는 변경할 수 없습니다.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jcode-bootstrap-namespaces-v2
+spec:
+  policyName: jcode-bootstrap-namespaces-v2
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jcode-bootstrap-rolebindings-v2
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["rolebindings"]
+  matchConditions:
+    - name: v2-bootstrap-service-account
+      expression: >-
+        request.userInfo.username in ['system:serviceaccount:dev:jcode-bootstrap-v2', 'system:serviceaccount:watcher:jcode-bootstrap-v2']
+  validations:
+    - expression: >-
+        request.operation == 'DELETE' || (object.metadata.name == 'jcode-workspace-runtime-v2' && object.roleRef.apiGroup == 'rbac.authorization.k8s.io' && object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'jcode-workspace-runtime-v2')
+      message: jcode-workspace-runtime-v2 RoleBinding만 허용됩니다.
+    - expression: >-
+        request.operation == 'DELETE' || (size(object.subjects) == 1 && object.subjects[0].kind == 'ServiceAccount' && object.subjects[0].name == 'jcode-workspace-v2' && request.userInfo.username == 'system:serviceaccount:' + object.subjects[0].namespace + ':jcode-bootstrap-v2')
+      message: 같은 controller namespace의 jcode-workspace-v2 ServiceAccount만 허용됩니다.
+    - expression: >-
+        request.operation != 'DELETE' || oldObject.metadata.name == 'jcode-workspace-runtime-v2'
+      message: Bootstrap v2가 관리하는 RoleBinding만 삭제할 수 있습니다.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jcode-bootstrap-rolebindings-v2
+spec:
+  policyName: jcode-bootstrap-rolebindings-v2
+  validationActions: [Deny]

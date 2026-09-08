@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+lineage=${1:-${RENEWED_LINEAGE:-}}
+[ -n "$lineage" ]
+[ -f "$lineage/fullchain.pem" ]
+[ -f "$lineage/privkey.pem" ]
+
+target=/etc/ssl/jedutools/haproxy-combined.pem
+previous=${target}.previous
+backup_host=${JEDUTOOLS_BACKUP_HOST:-172.22.204.113}
+backup_user=${JEDUTOOLS_BACKUP_USER:-ubuntu}
+backup_port=${JEDUTOOLS_BACKUP_PORT:-7777}
+sync_key=${JEDUTOOLS_SYNC_KEY:-/root/.ssh/jedutools-cert-sync}
+combined=$(mktemp)
+trap 'rm -f "$combined"' EXIT
+umask 077
+cat "$lineage/fullchain.pem" "$lineage/privkey.pem" > "$combined"
+
+openssl x509 -in "$combined" -noout >/dev/null
+openssl pkey -in "$combined" -noout >/dev/null
+openssl x509 -in "$combined" -checkend 86400 -noout >/dev/null
+subject_alt_names=$(openssl x509 -in "$combined" -noout -ext subjectAltName)
+printf '%s\n' "$subject_alt_names" | grep -Fq 'DNS:*.jedutools.io'
+printf '%s\n' "$subject_alt_names" | grep -Fq 'DNS:jedutools.io'
+cert_key=$(openssl x509 -in "$combined" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+private_key=$(openssl pkey -in "$combined" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+[ "$cert_key" = "$private_key" ]
+
+# The standby is updated first so the active node always has a valid fallback.
+backup_failed=0
+if ! ssh -i "$sync_key" -p "$backup_port" -o BatchMode=yes -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes "$backup_user@$backup_host" < "$combined"; then
+  backup_failed=1
+fi
+
+if [ -f "$target" ] && cmp -s "$combined" "$target"; then
+  exit "$backup_failed"
+fi
+
+if [ -f "$target" ]; then
+  install -m 0600 -o root -g root "$target" "$previous"
+fi
+install -m 0600 -o root -g root "$combined" "$target"
+if ! haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null; then
+  [ -f "$previous" ] && install -m 0600 -o root -g root "$previous" "$target"
+  exit 1
+fi
+if ! systemctl reload haproxy; then
+  [ -f "$previous" ] && install -m 0600 -o root -g root "$previous" "$target"
+  systemctl reload haproxy || true
+  exit 1
+fi
+systemctl is-active --quiet haproxy
+exit "$backup_failed"

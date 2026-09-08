@@ -6,11 +6,14 @@ const cors = require('cors');
 const redis = require('redis');
 const axios = require('axios');
 const cookie = require('cookie'); 
+const crypto = require('crypto');
 const client = require('prom-client');  // prometheus client
+const { createRedisClient } = require('./redis-client');
+const { extractSessionId, stripProxyPrefix, isVncPath, routeKeyForProfile } = require('./session-routing');
 require('dotenv').config();
 
 const app = express();
-const port = 3001;
+const port = Number.parseInt(process.env.PORT || '3001', 10);
 
 ///////////////////////////////////// prometheus client  //////////////////////////////////////////
 
@@ -45,9 +48,13 @@ app.use((req, res, next) => {
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
-// JWT 정보
-const JWT_SECRET = process.env.JWT_SECRET || "ACCESS_SECRET";
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "REFRESH_SECRET";
+// JWT 정보 (미설정 시 기동 차단)
+if (!process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET) {
+  console.error("FATAL: JWT_SECRET, JWT_REFRESH_SECRET 환경 변수가 반드시 설정되어야 합니다.");
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 
 // token refresh 엔드포인트
 const SPRING_REFRESH_URL = process.env.SPRING_REFRESH_URL || "SPRING_REFRESH_URL";
@@ -56,16 +63,15 @@ const SPRING_REFRESH_URL = process.env.SPRING_REFRESH_URL || "SPRING_REFRESH_URL
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || "localhost";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://localhost";
 
-// REDIS 정보
-const REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-const REDIS_PORT = parseInt(process.env.REDIS_PORT) || 6379;
-
 // Redis
-const redisClient = redis.createClient({ socket: { host: REDIS_HOST, port: REDIS_PORT }});
+const redisClient = createRedisClient(redis);
 redisClient.on('error', (err) => {
   console.error('Redis Client Error:', err);
 });
-redisClient.connect();
+redisClient.connect().catch((err) => {
+  console.error('FATAL: Redis connection failed:', err);
+  process.exit(1);
+});
 
 app.use(cookieParser());
 app.use(cors({
@@ -86,8 +92,10 @@ function closeWindowWithMessage(res, statusCode, message) {
     </head>
     <body>
       <script>
+        const sessionMatch = window.location.pathname.match(/^\\/jcode\\/session\\/([^/]+)/);
+        const logoutUrl = '/jcode-logout' + (sessionMatch ? '?session=' + encodeURIComponent(sessionMatch[1]) : '');
         // 1) 로그아웃 요청
-        fetch('/jcode-logout', {
+        fetch(logoutUrl, {
           method: 'POST',
           credentials: 'include'
         })
@@ -123,49 +131,65 @@ const cookieOptions = {
   maxAge: 6 * 3600 * 1000  
 };
 
-// 토큰 재발급 함수
+async function canAccessUserProfile(decoded, userProfile) {
+  const { sub, role } = decoded || {};
+  const { courseCode, clss, email } = userProfile || {};
+  if (!sub || !courseCode || !clss || !email) {
+    return false;
+  }
+  if (role === "ADMIN" || sub === email) {
+    return true;
+  }
+  return redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+}
+
+const refreshRequests = new Map();
+
+async function requestFreshTokens(req, currentToken) {
+  const response = await axios.post(`${SPRING_REFRESH_URL}`, null, {
+    withCredentials: true,
+    headers: {
+      Authorization: currentToken ? `Bearer ${currentToken}` : '',
+      Cookie: req.headers.cookie || ''
+    }
+  });
+  const authHeader = response.headers['authorization'] || response.headers['Authorization'];
+  if (!authHeader) throw new Error('Authorization header not found in refresh response');
+  const setCookieHeader = response.headers['set-cookie'];
+  const refreshCookie = Array.isArray(setCookieHeader)
+    ? setCookieHeader.find(value => value.startsWith('jcodeRt='))
+    : null;
+  const refreshMatch = refreshCookie && refreshCookie.match(/^jcodeRt=([^;]+);?/);
+  return {
+    accessToken: authHeader.replace(/^Bearer\s/, ''),
+    refreshToken: refreshMatch ? refreshMatch[1] : null
+  };
+}
+
+// 같은 refresh token으로 동시에 들어오는 asset 요청은 한 번만 재발급한다.
 const refreshAccessToken = async (req, res, next, currentToken) => {
   try {
-    const response = await axios.post(`${SPRING_REFRESH_URL}`, null, {
-      withCredentials: true,
-      headers: {
-        Authorization: currentToken ? `Bearer ${currentToken}` : '',
-        Cookie: req.headers.cookie || ''
-      }
-    });
-    
-    // 응답에서 Bearer 토큰 추출
-    const authHeader = response.headers['authorization'] || response.headers['Authorization'];
-    if (authHeader) {
-      const token = authHeader.replace(/^Bearer\s/, '');
-      // 새 access token
-      res.cookie('jcodeAt', token, cookieOptions);
-      req.cookies.jcodeAt = token;
-      
-      // refresh token 재발급
-      const setCookieHeader = response.headers['set-cookie'];
-      if (setCookieHeader && Array.isArray(setCookieHeader)) {
-        const newRefreshCookie = setCookieHeader.find(cookieStr => cookieStr.startsWith('jcodeRt='));
-        if (newRefreshCookie) {
-          const match = newRefreshCookie.match(/^jcodeRt=([^;]+);/);
-          if (match && match[1]) {
-            const newRefreshToken = match[1];
-            console.log("New refresh token extracted:", newRefreshToken);
-            res.cookie('jcodeRt', newRefreshToken, cookieOptions);
-            req.cookies.refreshToken = newRefreshToken;
-          }
-        }
-      }
-      
-      console.log("Access token refreshed:", token);
-      return next();
-    } else {
-      console.error("Authorization header not found in refresh response");
-      return closeWindowWithMessage(res, 500, "인증 재발급 중 오류가 발생했습니다. 다시 시도해주세요.");
+    const refreshMaterial = req.cookies.jcodeRt || req.headers.cookie || 'missing';
+    const refreshKey = crypto.createHash('sha256').update(refreshMaterial).digest('hex');
+    let pending = refreshRequests.get(refreshKey);
+    if (!pending) {
+      pending = requestFreshTokens(req, currentToken)
+        .finally(() => refreshRequests.delete(refreshKey));
+      refreshRequests.set(refreshKey, pending);
     }
+    const fresh = await pending;
+    res.cookie('jcodeAt', fresh.accessToken, cookieOptions);
+    req.cookies.jcodeAt = fresh.accessToken;
+    req.user = jwt.verify(fresh.accessToken, JWT_SECRET);
+    if (fresh.refreshToken) {
+      res.cookie('jcodeRt', fresh.refreshToken, cookieOptions);
+      req.cookies.jcodeRt = fresh.refreshToken;
+    }
+    console.log("Access token refreshed");
+    return next();
   } catch (err) {
-    console.error("Error during token refresh:", err);
-    return closeWindowWithMessage(res, 500, "인증 재발급에 실패했습니다. 다시 시도해주세요.");
+    console.error("Error during token refresh:", err.message);
+    return closeWindowWithMessage(res, 503, "인증 재발급에 실패했습니다. 다시 시도해주세요.");
   }
 };
 
@@ -181,12 +205,12 @@ const ensureAuthenticated = (req, res, next) => {
     if (decoded && decoded.exp) {
       const expTime = decoded.exp * 1000;
       const timeRemaining = expTime - Date.now();
-      if (timeRemaining < 540000) { // 9분 이하면 재발급
+      if (timeRemaining < 60000) { // 만료 1분 전부터 재발급
         console.log("Access token nearing expiration, refreshing...");
         return refreshAccessToken(req, res, next, token);
       } else {
         // 서명 검증
-        jwt.verify(token, JWT_SECRET);
+        req.user = jwt.verify(token, JWT_SECRET);
         return next();
       }
     } else {
@@ -210,23 +234,23 @@ const verifyTokenFromCookie = (req, res, next) => {
       return closeWindowWithMessage(res, 403, "인증에 실패하였습니다. 다시 시도해주세요.");
     }
     req.user = decoded;
-    console.log("Token Verified Successfully:", decoded);
+    console.log("Token verified successfully");
     next();
   });
 };
 
-// GET /jcode
-app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, next) => {
+async function loadSession(req, res, uuid) {
   try {
-    const uuid = req.query.id;
     if (!uuid) {
-      return closeWindowWithMessage(res, 400, "잘못된 접근입니다 (id 파라미터 누락).");
+      closeWindowWithMessage(res, 400, "유효한 프로젝트 세션이 없습니다.");
+      return false;
     }
     
     const redisKey = `user:profile:${uuid}`;
     const userProfile = await redisClient.hGetAll(redisKey);
     if (!userProfile || Object.keys(userProfile).length === 0) {
-      return closeWindowWithMessage(res, 404, "사용자 정보를 찾을 수 없습니다. 다시 시도해주세요.");
+      closeWindowWithMessage(res, 404, "사용자 정보를 찾을 수 없습니다. 다시 시도해주세요.");
+      return false;
     }
 
     // 프로필 접근 시 TTL 초기화 (6시간)
@@ -234,96 +258,65 @@ app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, n
     
     const { courseCode, clss, email: studentEmail } = userProfile;
     if (!courseCode || !clss || !studentEmail) {
-      return closeWindowWithMessage(res, 400, "필수 정보가 누락되었습니다 (courseCode, clss, email).");
+      closeWindowWithMessage(res, 400, "필수 프로젝트 정보가 누락되었습니다.");
+      return false;
     }
     
     const { sub, role } = req.user;
     console.log(`course: ${courseCode}:${clss}, studentEmail: ${studentEmail}, email: ${sub}, role: ${role}`);
-    
-    // 권한 체크
-    if (role && !role.includes("ADMIN")) {
-      if (role.includes("PROFESSOR") || role.includes("ASSISTANT")) {
-        const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
-        // 교수/조교인데 매니저 할당이 안 되어 있다면, 자신의 이메일인지 추가 체크합니다.
-        if (!isManager && sub !== studentEmail) {
-          return closeWindowWithMessage(res, 403,"이 강의에 접근 권한이 없습니다 (교수/조교 미할당 및 이메일 불일치).");
-        }
-      } else {
-        // 교수/조교가 아닌 경우, 자신의 이메일 여부만 확인합니다.
-        if (sub !== studentEmail) {
-          return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다 (이메일 불일치).");
-        }
-      }
+
+    if (!await canAccessUserProfile(req.user, userProfile)) {
+      closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
+      return false;
     }
     
     // targetUrl 조회
-    const redisKeyForTarget = (userProfile.snapshot === 'true' || userProfile.snapshot === true)
-      ? `user:${studentEmail}:course:${courseCode}:${clss}:snapshot`
-      : `user:${studentEmail}:course:${courseCode}:${clss}`;
+    const redisKeyForTarget = routeKeyForProfile(userProfile);
     const resolvedTargetUrl = await redisClient.get(redisKeyForTarget);
     if (!resolvedTargetUrl) {
-      return closeWindowWithMessage(res, 403, "프로젝트 URL을 찾을 수 없습니다.");
+      closeWindowWithMessage(res, 403, "프로젝트 URL을 찾을 수 없습니다.");
+      return false;
     }
     req.targetUrl = resolvedTargetUrl;
     console.log(`Resolved targetUrl for ${studentEmail}: ${resolvedTargetUrl}`);
     
-    // jcode-uuid 쿠키 저장
-    res.cookie('jcode-uuid', uuid, cookieOptions);
-    
-    next();
+    return true;
   } catch (error) {
     console.error("Error resolving targetUrl:", error.message);
-    return closeWindowWithMessage(res, 500, "서버 오류가 발생했습니다. 다시 시도해주세요.");
+    closeWindowWithMessage(res, 500, "서버 오류가 발생했습니다. 다시 시도해주세요.");
+    return false;
   }
+}
+
+// 기존 query 링크는 한 번만 canonical session path로 전환한다.
+app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res) => {
+  const uuid = req.query.id;
+  if (!await loadSession(req, res, uuid)) return;
+  res.cookie('jcode-uuid', uuid, cookieOptions); // 구버전 Router와의 rolling 호환
+  const query = new URLSearchParams(req.query);
+  query.delete('id');
+  const suffix = query.toString();
+  res.redirect(307, `/jcode/session/${encodeURIComponent(uuid)}/${suffix ? `?${suffix}` : ''}`);
 });
 
 // 프록시용 targetUrl 미들웨어
 const resolveTargetUrlMiddleware = async (req, res, next) => {
-  if (!req.targetUrl) {
-    const uuid = req.cookies['jcode-uuid'];
-    if (!uuid) {
-      return closeWindowWithMessage(res, 400, "유효한 프로젝트 정보를 찾을 수 없습니다 (jcode-uuid 미존재).");
-    }
-    try {
-      const redisKey = `user:profile:${uuid}`;
-      const userProfile = await redisClient.hGetAll(redisKey);
-      if (!userProfile || Object.keys(userProfile).length === 0) {
-        return closeWindowWithMessage(res, 404, "사용자 정보를 찾을 수 없습니다. 다시 시도해주세요.");
-      }
-      const { courseCode, clss, email } = userProfile;
-      const redisKeyForTarget = (userProfile.snapshot === 'true' || userProfile.snapshot === true)
-        ? `user:${email}:course:${courseCode}:${clss}:snapshot`
-        : `user:${email}:course:${courseCode}:${clss}`;
-      const resolvedTargetUrl = await redisClient.get(redisKeyForTarget);
-      if (!resolvedTargetUrl) {
-        return closeWindowWithMessage(res, 403, "프로젝트 URL을 찾을 수 없습니다.");
-      }
-
-      // 프로필 접근 시 TTL 초기화 (6시간)
-      await redisClient.expire(redisKey, 6 * 3600);
-    
-      req.targetUrl = resolvedTargetUrl;
-      console.log("Resolved targetUrl from jcode-uuid cookie:", req.targetUrl);
-      next();
-    } catch (error) {
-      console.error("Error resolving targetUrl from jcode-uuid cookie:", error.message);
-      return closeWindowWithMessage(res, 500, "서버 오류가 발생했습니다. 다시 시도해주세요.");
-    }
-  } else {
-    next();
-  }
+  if (req.targetUrl) return next();
+  const uuid = extractSessionId(req.originalUrl) || req.cookies['jcode-uuid'];
+  if (!await loadSession(req, res, uuid)) return;
+  next();
 };
 
 const proxy = createProxyMiddleware({
   changeOrigin: true,
   pathRewrite: (path, req) => {
-    const newPath = path.replace(/^\/proxy\/6080|^\/jcode|^\/websockify/, '');  
+    const newPath = stripProxyPrefix(path);
     console.log(`Proxying request => target: ${req.vncTargetUrl || req.wsTargetUrl || req.targetUrl}, path: ${newPath}`);
     return newPath;
   },
   router: (req) => {
     // VNC 요청(`/jcode/proxy/6080`)이면 `targetUrl`을 `vncTargetUrl`로 변환
-    if (req.url.startsWith('/proxy/6080')) {
+    if (isVncPath(req.originalUrl || req.url)) {
       if (req.targetUrl) {
         req.vncTargetUrl = req.targetUrl.replace(/:8080$/, ':6080'); // 8080 → 6080 변경
       }
@@ -337,49 +330,25 @@ const proxy = createProxyMiddleware({
 // 프록시 라우트
 app.use('/jcode', ensureAuthenticated, resolveTargetUrlMiddleware, proxy);
 
-// 로그아웃 라우트 (Redis에서 userProfile, courseKey 삭제)
-app.post('/jcode-logout', async (req, res) => {
+// IDE 창 종료는 해당 launch profile만 끝낸다. 인증 쿠키와 durable route는 다른 탭과 공유된다.
+app.post('/jcode-logout', ensureAuthenticated, async (req, res) => {
   try {
-    // 1) jcode-uuid 쿠키 확인
-    const jcodeUuid = req.cookies['jcode-uuid'];
+    const jcodeUuid = req.query.session ||
+      extractSessionId(req.get('referer') || '') ||
+      req.cookies['jcode-uuid'];
 
     if (jcodeUuid) {
-      // 2) Redis에서 user:profile:${jcodeUuid} 조회
-      const userProfile = await redisClient.hGetAll(`user:profile:${jcodeUuid}`);
-      if (userProfile && Object.keys(userProfile).length > 0) {
-        const { email, courseCode, clss } = userProfile;
-
-        // 3) userProfile 키 삭제
-        await redisClient.del(`user:profile:${jcodeUuid}`);
-
-        // 4) user:${email}:course:${courseCode}:${clss} 키도 삭제
-        if (email && courseCode && clss) {
-          const token = req.cookies.jcodeAt;
-          try {
-            const decodedToken = jwt.verify(token, JWT_SECRET);
-            if (decodedToken && decodedToken.sub === email) {
-              await redisClient.del(`user:${email}:course:${courseCode}:${clss}`);
-            } else {
-              console.warn("토큰에 포함된 이메일과 사용자 이메일이 일치하지 않습니다. Redis 키 삭제를 건너뜁니다.");
-            }
-          } catch (err) {
-            console.error("토큰 검증 중 오류 발생:", err);
-          }
+      const profileKey = `user:profile:${jcodeUuid}`;
+      const profile = await redisClient.hGetAll(profileKey);
+      if (profile && Object.keys(profile).length > 0) {
+        if (!await canAccessUserProfile(req.user, profile)) {
+          return res.status(403).send("No permission for this session");
         }
+        await redisClient.del(profileKey);
       }
     }
 
-    // 5) 쿠키 제거
-    res.clearCookie('jcodeAt', {
-      domain: COOKIE_DOMAIN,
-      path: '/'
-    });
-    res.clearCookie('jcode-uuid', {
-      domain: COOKIE_DOMAIN,
-      path: '/'
-    });
-
-    return res.status(200).send("Logged out");
+    return res.status(200).send("Session closed");
   } catch (err) {
     console.error("Logout Error:", err);
     return res.status(500).send("Error while logging out");
@@ -401,15 +370,16 @@ server.on('upgrade', async (req, socket, head) => {
       socket.destroy();
       return;
     }
+    let decoded;
     try {
-      jwt.verify(token, JWT_SECRET);
+      decoded = jwt.verify(token, JWT_SECRET);
     } catch (err) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\nInvalid access token');
       socket.destroy();
       return;
     }
 
-    const jcodeUuid = cookies['jcode-uuid'];
+    const jcodeUuid = extractSessionId(req.url) || cookies['jcode-uuid'];
     if (!jcodeUuid) {
       socket.write('HTTP/1.1 400 Bad Request\r\n\r\nMissing jcode-uuid cookie');
       socket.destroy();
@@ -421,10 +391,15 @@ server.on('upgrade', async (req, socket, head) => {
       socket.destroy();
       return;
     }
-    const { courseCode, clss, email, snapshot } = userProfile;
-    const redisKeyForTarget = (snapshot === 'true' || snapshot === true)
-      ? `user:${email}:course:${courseCode}:${clss}:snapshot`
-      : `user:${email}:course:${courseCode}:${clss}`;
+    const { email } = userProfile;
+
+    if (!await canAccessUserProfile(decoded, userProfile)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\nNo permission for this project');
+      socket.destroy();
+      return;
+    }
+
+    const redisKeyForTarget = routeKeyForProfile(userProfile);
     const ideTargetUrl = await redisClient.get(redisKeyForTarget);
     if (!ideTargetUrl) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\nMissing targetUrl in Redis');
@@ -435,7 +410,7 @@ server.on('upgrade', async (req, socket, head) => {
       .replace(/^http:/, 'ws:')
       .replace(/^https:/, 'wss:');
 
-    if (req.url.startsWith('/websockify')) {
+    if (isVncPath(req.url)) {
         wsTargetUrl = wsTargetUrl
           .replace(/:8080/, ':6080');
       }

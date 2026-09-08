@@ -1,0 +1,122 @@
+name: JCode IDE images
+
+on:
+  workflow_call:
+    inputs:
+      base_digest:
+        description: "CodeServer base digest"
+        required: true
+        type: string
+      base_revision:
+        description: "CodeServer base commit SHA"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ${{ vars.HARBOR_REGISTRY || 'harbor.jedutools.io' }}
+  PROJECT: jdevops
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+      - name: Resolve develop revision
+        run: echo "JCODE_REF=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if printf '%s' "$HARBOR_PASSWORD" | timeout 30 docker login "$REGISTRY" --username "$HARBOR_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          exit 1
+      - name: Verify CodeServer base image
+        env:
+          BASE_DIGEST: ${{ inputs.base_digest }}
+          BASE_REVISION: ${{ inputs.base_revision }}
+        run: |
+          [[ "$BASE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$BASE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          docker buildx imagetools inspect "${REGISTRY}/${PROJECT}/jcode-codeserver@${BASE_DIGEST}"
+          tag_digest=$(docker buildx imagetools inspect "${REGISTRY}/${PROJECT}/jcode-codeserver:${BASE_REVISION}" | awk '$1 == "Digest:" {print $2; exit}')
+          [[ "$tag_digest" == "$BASE_DIGEST" ]]
+      - name: Build JCode IDE image
+        id: ide
+        uses: docker/build-push-action@v6
+        with:
+          context: image/code-server
+          push: true
+          build-args: |
+            JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_BASE_DIGEST=${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_REVISION=${{ inputs.base_revision }}
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/code-server:${{ env.JCODE_REF }}
+          provenance: true
+          sbom: true
+      - name: Build JCode VNC image
+        id: vnc
+        uses: docker/build-push-action@v6
+        with:
+          context: image/code-server-vnc
+          push: true
+          build-args: |
+            JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_BASE_DIGEST=${{ inputs.base_digest }}
+            JCODE_CODE_SERVER_REVISION=${{ inputs.base_revision }}
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/code-server-vnc:${{ env.JCODE_REF }}
+          provenance: true
+          sbom: true
+      - name: Smoke test JCode IDE images
+        run: |
+          ide_image="${REGISTRY}/${PROJECT}/code-server:${JCODE_REF}"
+          vnc_image="${REGISTRY}/${PROJECT}/code-server-vnc:${JCODE_REF}"
+          docker run --detach --rm --name jcode-ide-smoke \
+            --user 1000:1000 \
+            --publish 127.0.0.1:18080:8080 \
+            --tmpfs /home/coder/project:uid=1000,gid=1000 \
+            "$ide_image" \
+            --bind-addr 0.0.0.0:8080 --auth none \
+            --disable-workspace-trust \
+            /home/coder/project
+          docker run --detach --rm --name jcode-vnc-smoke \
+            --user 1000:1000 \
+            --publish 127.0.0.1:18081:8080 \
+            --publish 127.0.0.1:16080:6080 \
+            --tmpfs /home/coder/project:uid=1000,gid=1000 \
+            --env 'CODE_SERVER_EXTRA_ARGS=--disable-workspace-trust /home/coder/project' \
+            "$vnc_image"
+          trap 'docker stop jcode-ide-smoke jcode-vnc-smoke' EXIT
+          for port in 18080 18081; do
+            for _ in $(seq 1 60); do
+              if curl --fail --silent --output /dev/null "http://127.0.0.1:${port}/healthz"; then
+                break
+              fi
+              sleep 2
+            done
+            curl --fail --silent --output /dev/null "http://127.0.0.1:${port}/healthz"
+          done
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:16080/vnc.html; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail --silent --output /dev/null http://127.0.0.1:16080/vnc.html
+          docker exec jcode-vnc-smoke nc -z 127.0.0.1 5901
+          test "$(docker inspect --format '{{.State.Running}}' jcode-ide-smoke)" = true
+          test "$(docker inspect --format '{{.State.Running}}' jcode-vnc-smoke)" = true
+      - name: Record immutable image digests
+        run: |
+          echo 'ide=${{ steps.ide.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+          echo 'vnc=${{ steps.vnc.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"

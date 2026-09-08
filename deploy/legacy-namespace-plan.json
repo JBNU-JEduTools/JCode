@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "environments": {
+    "dev": {
+      "jcode-dev-1": {
+        "action": "quarantine",
+        "reason": "course metadata가 없는 기존 dev 시험 namespace"
+      },
+      "jcode-realtest2-1": {
+        "action": "migrate",
+        "course_id": 6,
+        "target_namespace": "jcode-dev-realtest2-1",
+        "use_vnc": false,
+        "session_policy": "recreate"
+      },
+      "jcode-test2502-1": {
+        "action": "migrate",
+        "course_id": 1,
+        "target_namespace": "jcode-dev-test2502-1",
+        "use_vnc": false,
+        "session_policy": "recreate"
+      }
+    },
+    "prod": {
+      "jcode-jct-1": {
+        "action": "quarantine",
+        "reason": "course metadata가 없는 기존 production namespace이며 기존 workload는 유지"
+      }
+    }
+  }
+}

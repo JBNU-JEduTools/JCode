@@ -15,9 +15,16 @@ spec:
       labels:
         app: squid-exporter
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+      - name: watcher-harbor-registry-secret
       containers:
       - name: squid-exporter
-        image: boynux/squid-exporter:latest
+        image: harbor.jedutools.io/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA
         env:
           - name: SQUID_EXPORTER_LISTEN
             value: ":9308"
@@ -31,6 +38,36 @@ spec:
           #   value: "your_password"
         ports:
         - containerPort: 9308
+        startupProbe:
+          httpGet:
+            path: /metrics
+            port: 9308
+          periodSeconds: 5
+          failureThreshold: 24
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9308
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: 9308
+          periodSeconds: 20
+        resources:
+          requests:
+            cpu: 25m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
 ---
 apiVersion: v1
 kind: Service

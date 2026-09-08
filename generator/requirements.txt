@@ -1,7 +1,9 @@
-fastapi
-uvicorn[standard]
-kubernetes
-PyJWT
-python-dotenv
-prometheus_client
-prometheus_fastapi_instrumentator
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+python-multipart==0.0.20
+kubernetes==35.0.0
+PyJWT==2.13.0
+python-dotenv==1.2.1
+prometheus_client==0.26.0
+prometheus_fastapi_instrumentator==7.1.0
+PyMySQL==1.2.0

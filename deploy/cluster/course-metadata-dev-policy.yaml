@@ -1,0 +1,31 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jcode-course-metadata-dev-v2
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["configmaps"]
+  matchConditions:
+    - name: dev-course-metadata
+      expression: >-
+        (request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name) == 'jcode-course-metadata' && (request.operation == 'DELETE' ? oldObject.metadata.namespace : object.metadata.namespace).startsWith('jcode-dev-')
+  validations:
+    - expression: >-
+        request.operation == 'CREATE' || (request.operation == 'DELETE' && request.userInfo.username == 'system:serviceaccount:kube-system:namespace-controller')
+      message: dev course metadata ConfigMap은 생성 후 변경하거나 직접 삭제할 수 없습니다.
+    - expression: >-
+        request.operation != 'CREATE' || (request.userInfo.username == 'system:serviceaccount:dev:jcode-bootstrap-v2' && object.immutable == true && object.data['namespace'] == object.metadata.namespace && object.data['course-id'].matches('^[1-9][0-9]*$') && object.data['environment'] == 'dev')
+      message: dev course metadata는 dev Bootstrap v2만 올바른 값으로 생성할 수 있습니다.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jcode-course-metadata-dev-v2
+spec:
+  policyName: jcode-course-metadata-dev-v2
+  validationActions: [Deny]

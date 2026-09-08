@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry jedutools.io HAProxy certificate synchronization daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

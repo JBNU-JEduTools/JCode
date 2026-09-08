@@ -2,6 +2,8 @@
 generator/.env
 generator/docker-compose.yaml
 generator/*.tar
+__pycache__/
+*.py[cod]
 
 ### router ###
 router/dev/
@@ -12,6 +14,7 @@ router/squid/squid.conf
 router/supervisor/supervisord.conf
 router/supervisord/
 router/*.tar
+router/node_modules/
 
 ### k8s manifest ###
 /k8s/

@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel-headless
+  labels:
+    app: redis-sentinel
+    app.kubernetes.io/part-of: jcode
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis-sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: sentinel
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-sentinel
+  labels:
+    app: redis-sentinel
+    app.kubernetes.io/part-of: jcode
+spec:
+  serviceName: redis-sentinel-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: redis-sentinel
+  template:
+    metadata:
+      labels:
+        app: redis-sentinel
+    spec:
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: redis-sentinel
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sentinel
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command: [/scripts/start-sentinel.sh]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: jcode-redis-secret
+                  key: REDIS_PASSWORD
+          ports:
+            - name: sentinel
+              containerPort: 26379
+          volumeMounts:
+            - name: sentinel-data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          startupProbe:
+            exec:
+              command: [sh, -ec, 'exec redis-cli --no-auth-warning -p 26379 -a "$REDIS_PASSWORD" ping']
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: [sh, -ec, 'exec redis-cli --no-auth-warning -p 26379 -a "$REDIS_PASSWORD" ping']
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [sh, -ec, 'exec redis-cli --no-auth-warning -p 26379 -a "$REDIS_PASSWORD" ping']
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: scripts
+          configMap:
+            name: redis-ha-scripts
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: sentinel-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn-r2-retain
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-sentinel-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: redis-sentinel

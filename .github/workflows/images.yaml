@@ -1,0 +1,47 @@
+name: JCode runtime images
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'generator/**'
+      - 'router/**'
+      - 'image/workspace-init/**'
+      - 'image/squid-exporter/**'
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ${{ vars.HARBOR_REGISTRY || 'harbor.jedutools.io' }}
+  PROJECT: jdevops
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - component: jcode-generator
+            context: generator
+          - component: jcode-router
+            context: router
+          - component: workspace-init
+            context: image/workspace-init
+          - component: squid-exporter
+            context: image/squid-exporter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build immutable image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.component }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+      - name: Record digest
+        run: echo '${{ matrix.component }}=${{ steps.image.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"

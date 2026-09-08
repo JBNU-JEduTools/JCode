@@ -6,6 +6,8 @@ metadata:
 data:
   NODE_ENV: "production"
   PORT: "3001"
+  CORS_ORIGIN: "https://your.domain"
+  COOKIE_DOMAIN: "your.domain"
   SPRING_REFRESH_URL: "https://your.domain/refresh"
   REDIS_HOST: "localhost"
   REDIS_PORT: "6379"

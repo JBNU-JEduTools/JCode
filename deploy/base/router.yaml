@@ -6,6 +6,7 @@ metadata:
   labels:
     app: jcode-router
 spec:
+  replicas: 2
   selector:
     matchLabels:
       app: jcode-router
@@ -14,9 +15,29 @@ spec:
       labels:
         app: jcode-router
     spec:
+      automountServiceAccountToken: false
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: jcode-router
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: jcode-router
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: watcher-harbor-registry-secret
       containers:
         - name: jcode-router
-          image: jcode-router:test
+          image: harbor.jedutools.io/jdevops/jcode-router:REPLACE_WITH_COMMIT_SHA
           ports:
             - containerPort: 3001  # Node.js 프록시 포트
             - containerPort: 3000  # Squid 프록시 포트 추가
@@ -31,6 +52,21 @@ spec:
               memory: 1.5Gi
             limits:
               memory: 7Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+          startupProbe:
+            tcpSocket:
+              port: 3001
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            tcpSocket:
+              port: 3001
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 3001
+            periodSeconds: 20
           volumeMounts:
             - name: squid-config
               mountPath: /etc/squid/squid.conf

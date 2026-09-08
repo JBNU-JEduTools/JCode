@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jcode-bootstrap-v2
+  namespace: watcher
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jcode-bootstrap
+  namespace: watcher
+  labels:
+    app: jcode-bootstrap
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jcode-bootstrap
+  template:
+    metadata:
+      labels:
+        app: jcode-bootstrap
+    spec:
+      serviceAccountName: jcode-bootstrap-v2
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "2"
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+      - name: watcher-harbor-registry-secret
+      containers:
+      - name: bootstrap
+        image: harbor.jedutools.io/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: jcode-generator-configmap
+        - secretRef:
+            name: jcode-generator-secret
+        env:
+        - name: CONTROLLER_MODE
+          value: "bootstrap"
+        - name: JCODE_ENVIRONMENT
+          value: "prod"
+        - name: REQUEST_NAMESPACE_PREFIX
+          value: "jcode-"
+        - name: COURSE_NAMESPACE_PREFIX
+          value: "jcode-"
+        - name: WORKSPACE_CONTROLLER_SA
+          value: "jcode-workspace-v2"
+        - name: WORKSPACE_RUNTIME_CLUSTER_ROLE
+          value: "jcode-workspace-runtime-v2"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: http
+          containerPort: 5000
+        startupProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          periodSeconds: 5
+          failureThreshold: 36
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jcode-bootstrap-svc
+  namespace: watcher
+spec:
+  selector:
+    app: jcode-bootstrap
+  ports:
+  - name: http
+    port: 5000
+    targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jcode-bootstrap-backend-only
+  namespace: watcher
+spec:
+  podSelector:
+    matchLabels:
+      app: jcode-bootstrap
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: jcode-backend
+    - podSelector:
+        matchLabels:
+          app: jcode-assignment-path-backfill
+    ports:
+    - protocol: TCP
+      port: 5000
+  policyTypes: ["Ingress"]
