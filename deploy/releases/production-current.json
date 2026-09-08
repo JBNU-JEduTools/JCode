@@ -1,11 +1,11 @@
 {
   "schema": 3,
   "environment": "production",
-  "capturedAt": "2026-09-07T22:13:15+09:00",
+  "capturedAt": "2026-09-08T18:04:15+09:00",
   "revisions": {
-    "jcode": "f728affd18ceee5a29b2008410d55abd810e99c8",
-    "backend": "330ec5f268847c49f7cd2ac1091d77a0e858a9e0",
-    "frontend": "6c5a3a82ccae02bcbfeee70fedce4b2ccaa7a2f6",
+    "jcode": "de684df3484e6ef8cb7b9ab0d1398b769589ce5b",
+    "backend": "527077a400955e1c83271a505f6944ddbcf5da7f",
+    "frontend": "bd5fab9bd9cf80b7e2bd43d7d30eb4bd4987178a",
     "watcher": "0eae8f3e5f73fcc9e9da8fbb7d2b3c313568d932",
     "code_server": "ff61ac44b9f774bf436f7277fb26bb74287d4879"
   },
@@ -19,7 +19,7 @@
     "code_server_vnc": "sha256:ddeeb7794a2ff467069e4281b66d09e1a67a04a7ba106263e6553445af109ed9",
     "workspace_init": "sha256:aadcea977014b52c18bef4f7e16940458a7ac244ae94acfc2b864369b37c2ba3",
     "squid_exporter": "sha256:0bc67ca1ccde0d7d227c4ffbeae9963355277fceacfbcd96308191f29fd02649",
-    "backend": "sha256:4241a5b6824d64080f77c7d5874eee89f84d9e9c184a62fd05a64d2288e707ea",
-    "frontend": "sha256:ab09857e7c972a2566b1636a907bb633edeababe6756905f6b2cc67b119116df"
+    "backend": "sha256:36ee318e9c20dc87bb7d853fb131e82b567deb1f42f2aa919e4a9ce380c5149b",
+    "frontend": "sha256:ef317e0c30ed6a43c62fbfa8d1c8074f65fbb819cfff210e3f4ec312d40e2f84"
   }
 }
